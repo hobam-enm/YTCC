@@ -1,8 +1,4 @@
-# -*- coding: utf-8 -*-
 # 📊 유튜브 반응 리포트: AI 댓글요약 (Streamlit Cloud용 / 동시실행 1 슬롯 락 포함)
-# - 로그 기록 기능 완전 제거 (append_log는 no-op)
-# - Cloud 저장 경로: /tmp
-# - 세션 아카이브: "YYYYMMDD_HHMMSS_검색어" 폴더명으로 저장
 
 import streamlit as st
 import pandas as pd
@@ -525,6 +521,17 @@ def render_keyword_bubble(s_df_comments):
             "그게","일단","모든","위해","대한","있지","이유","계속","실제","유튜브","이번","가장",
         }
         stopset = set(korean_stopwords); stopset.update(custom_stopwords)
+
+        # 🔑 검색어 불용어 추가
+        query_kw = (st.session_state.get("s_query") 
+                    or st.session_state.get("last_keyword") 
+                    or st.session_state.get("adv_analysis_keyword") 
+                    or "").strip()
+        if query_kw:
+            tokens_q = kiwi.tokenize(query_kw, normalize_coda=True)
+            query_words = [t.form for t in tokens_q if t.tag in ("NNG","NNP") and len(t.form) > 1]
+            stopset.update(query_words)
+
         texts = " ".join(s_df_comments["text"].astype(str).tolist())
         tokens = kiwi.tokenize(texts, normalize_coda=True)
         words = [t.form for t in tokens if t.tag in ("NNG","NNP") and len(t.form) > 1 and t.form not in stopset]
@@ -1180,3 +1187,4 @@ if st.button("🔄 초기화 하기", type="secondary"):
     for k in list(st.session_state.keys()):
         del st.session_state[k]
     st.rerun()
+
