@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 # 📊 유튜브 반응 리포트: AI 댓글요약 (Streamlit Cloud용 / 동시실행 1 슬롯 락 포함)
+# - 로그 기록 기능 완전 제거 (append_log는 no-op)
+# - Cloud 저장 경로: /tmp
+# - 세션 아카이브: "YYYYMMDD_HHMMSS_검색어" 폴더명으로 저장
 
 import streamlit as st
 import pandas as pd
-import io, os, json, re, time, csv, shutil
+import io, os, json, re, time, shutil
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, parse_qs
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -25,33 +28,15 @@ try:
 except Exception:
     ILLEGAL_CHARACTERS_RE = None
 
-# ===================== Cloud 호환 설정 =====================
-# Cloud에서는 /tmp만 쓰기 가능
-IS_CLOUD = bool(os.environ.get("STREAMLIT_RUNTIME") or os.environ.get("STREAMLIT_SERVER_ENABLED"))
-BASE_DIR = "/tmp" if IS_CLOUD else r"C:\Users\user\Desktop"
-
-LOG_DIR = os.path.join(BASE_DIR, "log")
-LOG_CSV = os.path.join(LOG_DIR, "yt_comment_tool_log.csv")
-SESS_DIR = os.path.join(LOG_DIR, "sessions")
-os.makedirs(LOG_DIR, exist_ok=True)
+# ===================== 기본 경로(Cloud) =====================
+BASE_DIR = "/tmp"  # Streamlit Cloud는 /tmp만 쓰기 가능(휘발성)
+SESS_DIR = os.path.join(BASE_DIR, "sessions")
 os.makedirs(SESS_DIR, exist_ok=True)
-
-def append_log(mode: str, keyword: str, question: str = ""):
-    is_new = not os.path.exists(LOG_CSV)
-    with open(LOG_CSV, "a", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f)
-        if is_new:
-            w.writerow(["time", "mode", "keyword", "question"])
-        w.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), mode, keyword, question])
 
 # ===================== 비밀키 / 파라미터 =====================
 # secrets 우선, 없으면 하드코딩 백업
-_YT_FALLBACK = [
-    # (원한다면 백업 키를 비워둬도 됨)
-]
-_GEM_FALLBACK = [
-    # (원한다면 백업 키를 비워둬도 됨)
-]
+_YT_FALLBACK = []
+_GEM_FALLBACK = []
 
 YT_API_KEYS = list(st.secrets.get("YT_API_KEYS", [])) or _YT_FALLBACK
 GEMINI_API_KEYS = list(st.secrets.get("GEMINI_API_KEYS", [])) or _GEM_FALLBACK
@@ -115,6 +100,11 @@ def clean_illegal(val):
 # ===================== 형태소/불용어 =====================
 kiwi = Kiwi()
 korean_stopwords = stopwords.stopwords("ko")
+
+# ===================== (로그 제거) append_log → no-op =====================
+def append_log(*args, **kwargs):
+    # 로그 비활성화: 아무것도 하지 않음
+    return
 
 # ===================== 키 로테이터 =====================
 class RotatingKeys:
@@ -480,8 +470,19 @@ def _save_df_csv(df: pd.DataFrame, path: str):
     if df is None or (hasattr(df, "empty") and df.empty): return
     df.to_csv(path, index=False, encoding="utf-8-sig")
 
-def save_current_session(name_prefix="sess"):
-    sess_id = f"{name_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+def _slugify_filename(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"[^\w\-]+", "", s)
+    if not s:
+        s = "no_kw"
+    return s[:60]
+
+def save_current_session(name_prefix: str | None = None):
+    # 제목 = YYYYMMDD_HHMMSS_검색어 (검색어: 심플 s_query 우선, 없으면 last_keyword)
+    kw = st.session_state.get("s_query") or st.session_state.get("last_keyword") or ""
+    kw_slug = _slugify_filename(kw)
+    sess_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{kw_slug}"
     outdir = os.path.join(SESS_DIR, sess_id)
     os.makedirs(outdir, exist_ok=True)
     qa_data = {
@@ -517,11 +518,11 @@ def render_keyword_bubble(s_df_comments):
     st.subheader("① 키워드 버블")
     try:
         custom_stopwords = {
-            # (기존 커스텀 불용어 목록 유지)
+            # (기존 커스텀 불용어 목록 예시 — 필요시 추가/수정)
             "아","휴","아이구","아이쿠","아이고","어","나","우리","저희","따라","의해","을","를",
             "에","의","가","으로","로","에게","뿐이다","의거하여","근거하여","입각하여","기준으로",
-            # ... (중략: 긴 불용어 목록은 동일하게 유지)
-            "이형","이기"
+            "그냥","댓글","영상","오늘","이제","뭐","진짜","정말","부분","요즘","제발","완전",
+            "그게","일단","모든","위해","대한","있지","이유","계속","실제","유튜브","이번","가장",
         }
         stopset = set(korean_stopwords); stopset.update(custom_stopwords)
         texts = " ".join(s_df_comments["text"].astype(str).tolist())
@@ -681,7 +682,7 @@ def handle_followup_simple():
         st.error("Gemini API Key가 없습니다."); return
     if not st.session_state.get("s_serialized_sample"):
         st.error("분석 샘플이 없습니다. 먼저 수집/분석 실행."); return
-    append_log("심플-추가", st.session_state.get("s_query",""), follow_q)
+    append_log("심플-추가", st.session_state.get("s_query",""), follow_q)  # no-op
     context_str = build_history_context(st.session_state.get("s_history", []))
     system_instruction = (
         "너는 유튜브 댓글을 분석하는 어시스턴트다. "
@@ -707,7 +708,7 @@ def handle_followup_advanced():
     df_analysis = st.session_state.get("df_analysis")
     if df_analysis is None or df_analysis.empty:
         st.error("분석 샘플이 없습니다. 먼저 수집/분석 실행."); return
-    append_log("고급-추가", st.session_state.get("last_keyword",""), adv_follow_q)
+    append_log("고급-추가", st.session_state.get("last_keyword",""), adv_follow_q)  # no-op
     a_text = st.session_state.get("adv_serialized_sample", "") or serialize_comments_for_llm(df_analysis)[0]
     context_str = build_history_context(st.session_state.get("adv_history", []))
     system_instruction = (
@@ -776,7 +777,7 @@ with tab_simple:
                 st.session_state["s_query"] = st.session_state["simple_query"].strip()
                 st.session_state["s_preset"] = preset_simple
                 st.session_state["s_history"] = []
-                append_log("심플", st.session_state["s_query"], st.session_state.get("simple_question", ""))
+                append_log("심플", st.session_state["s_query"], st.session_state.get("simple_question", ""))  # no-op
 
                 status_ph = st.empty()
                 with status_ph.status("심플 모드 실행 중…", expanded=True) as status:
@@ -874,7 +875,7 @@ with tab_simple:
     render_downloads(s_df_comments, s_df_analysis, s_df_stats, prefix="simple")
 
     if st.button("💾 세션 저장하기", key="simple_save_session"):
-        sid = save_current_session("sess")
+        sid = save_current_session(None)
         st.success(f"세션 저장 완료: {sid}")
 
 # ===================== 2) 고급 모드 =====================
@@ -1096,7 +1097,7 @@ with tab_advanced:
                     if not lock_guard_start_or_warn():
                         st.stop()
                     try:
-                        append_log("고급", analysis_keyword, user_question_adv)
+                        append_log("고급", analysis_keyword, user_question_adv)  # no-op
                         st.session_state["adv_history"] = []
                         st.session_state["adv_followups"] = []
                         a_text = st.session_state.get("adv_serialized_sample", "") or serialize_comments_for_llm(df_analysis)[0]
@@ -1129,7 +1130,7 @@ with tab_advanced:
                 st.button("질문 보내기(고급)", key="adv_follow_btn", on_click=handle_followup_advanced)
 
                 if st.button("💾 세션 저장하기", key="adv_save_session_analysis"):
-                    sid = save_current_session("sess")
+                    sid = save_current_session(None)
                     st.success(f"세션 저장 완료: {sid}")
 
     render_quant_viz(st.session_state.get("df_comments"), st.session_state.get("df_stats"), scope_label="(KST 기준)")
@@ -1137,7 +1138,7 @@ with tab_advanced:
                      st.session_state.get("df_stats"), prefix=f"adv_{len(st.session_state.get('selected_ids', []))}vids")
 
     if st.button("💾 세션 저장하기", key="adv_save_session_comments"):
-        sid = save_current_session("sess")
+        sid = save_current_session(None)
         st.success(f"세션 저장 완료: {sid}")
 
 # ===================== 3) 세션 아카이브 =====================
