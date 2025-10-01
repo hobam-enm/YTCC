@@ -81,27 +81,7 @@ def lock_guard_start_or_warn():
 # ===================== 기본 UI =====================
 st.set_page_config(page_title="📊 유튜브 반응 리포트: AI 댓글요약", layout="wide", initial_sidebar_state="collapsed")
 st.title("📊 유튜브 반응 분석: AI 댓글요약")
-
-st.markdown(
-    """
-    <style>
-    .made-by {
-        position: fixed;
-        top: 15px;
-        right: 20px;
-        background: rgba(255,255,255,0.8);
-        padding: 5px 12px;
-        border-radius: 8px;
-        font-size: 14px;
-        font-weight: bold;
-        color: #333;
-        z-index: 9999;
-    }
-    </style>
-    <div class="made-by">사용문의 : 미디어)디지털마케팅팀</div>
-    """,
-    unsafe_allow_html=True
-)
+st.caption("문의사항:미디어)디지털마케팅팀")
 
 _YT_ID_RE = re.compile(r'^[A-Za-z0-9_-]{11}$')
 def _kst_tz(): return timezone(timedelta(hours=9))
@@ -1208,6 +1188,7 @@ if st.button("🔄 초기화 하기", type="secondary"):
     for k in list(st.session_state.keys()):
         del st.session_state[k]
     st.rerun()
+
 
 
 
