@@ -1,14 +1,15 @@
-# 📊 유튜브 반응 리포트: AI 댓글요약 (Streamlit Cloud용 / 동시실행 1 슬롯 락 포함)
+# 📊 유튜브 반응 리포트: AI 댓글요약 (Streamlit Cloud용 / GitHub 세션 아카이브)
 
 import streamlit as st
 import pandas as pd
-import io, os, json, re, time, shutil
+import io, os, json, re, time, shutil, traceback, base64, requests
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, parse_qs
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+
 import google.generativeai as genai
 
 import plotly.express as px
@@ -39,6 +40,61 @@ GEMINI_API_KEYS = list(st.secrets.get("GEMINI_API_KEYS", [])) or _GEM_FALLBACK
 GEMINI_MODEL = "gemini-2.0-flash-lite"
 GEMINI_TIMEOUT = 120
 GEMINI_MAX_TOKENS = 2048
+
+# --- GitHub 저장소 설정 ---
+GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN", "")
+GITHUB_REPO = st.secrets.get("GITHUB_REPO", "")
+GITHUB_BRANCH = st.secrets.get("GITHUB_BRANCH", "main")
+
+def _gh_headers(token: str):
+    h = {"Accept": "application/vnd.github+json"}
+    if token:
+        h["Authorization"] = f"token {token}"
+    return h
+
+def github_upload_file(repo, branch, path_in_repo, local_path, token):
+    """Contents API: PUT /repos/{owner}/{repo}/contents/{path}"""
+    url = f"https://api.github.com/repos/{repo}/contents/{path_in_repo}"
+    with open(local_path, "rb") as f:
+        content = base64.b64encode(f.read()).decode("utf-8")
+    headers = _gh_headers(token)
+    # 기존 sha 확인
+    get_resp = requests.get(url + f"?ref={branch}", headers=headers)
+    sha = get_resp.json().get("sha") if get_resp.status_code == 200 else None
+    data = {
+        "message": f"upload {path_in_repo}",
+        "content": content,
+        "branch": branch,
+    }
+    if sha:
+        data["sha"] = sha
+    resp = requests.put(url, headers=headers, json=data)
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"GitHub 업로드 실패: {resp.text}")
+    return resp.json()
+
+def github_list_dir(repo, branch, folder, token):
+    """GET /repos/{owner}/{repo}/contents/{folder}"""
+    url = f"https://api.github.com/repos/{repo}/contents/{folder}?ref={branch}"
+    headers = _gh_headers(token)
+    resp = requests.get(url, headers=headers)
+    if resp.status_code != 200:
+        return []
+    return resp.json()
+
+def github_download_file(repo, branch, path_in_repo, token, local_path):
+    """GET /repos/{owner}/{repo}/contents/{path}"""
+    url = f"https://api.github.com/repos/{repo}/contents/{path_in_repo}?ref={branch}"
+    headers = _gh_headers(token)
+    resp = requests.get(url, headers=headers)
+    if resp.status_code == 200:
+        data = resp.json()
+        content = base64.b64decode(data["content"])
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        with open(local_path, "wb") as f:
+            f.write(content)
+        return True
+    return False
 
 # 수집 상한(필요시 조정)
 MAX_TOTAL_COMMENTS = 200_000
@@ -78,10 +134,10 @@ def lock_guard_start_or_warn():
         return False
     return True
 
-# ===================== 기본 UI =====================
+# ===================== 기본 UI 세팅 =====================
 st.set_page_config(page_title="📊 유튜브 반응 리포트: AI 댓글요약", layout="wide", initial_sidebar_state="collapsed")
 st.title("📊 유튜브 반응 분석: AI 댓글요약")
-st.caption("문의사항:미디어)디지털마케팅팀 데이터파트")
+st.caption("문의사항: 미디어)디지털마케팅팀 데이터파트")
 
 _YT_ID_RE = re.compile(r'^[A-Za-z0-9_-]{11}$')
 def _kst_tz(): return timezone(timedelta(hours=9))
@@ -100,20 +156,28 @@ korean_stopwords = stopwords.stopwords("ko")
 
 # ===================== (로그 제거) append_log → no-op =====================
 def append_log(*args, **kwargs):
-    # 로그 비활성화: 아무것도 하지 않음
     return
 
-# ===================== 키 로테이터 =====================
+# ===================== 키 로테이터 (범용화) =====================
 class RotatingKeys:
-    def __init__(self, keys: list[str], state_key: str, on_rotate=None):
-        keys = [k.strip() for k in (keys or []) if k and k.strip()]
-        self.keys = keys[:10]
+    def __init__(self, keys, state_key: str, on_rotate=None, treat_as_strings: bool = True):
+        cleaned = []
+        for k in (keys or []):
+            if k is None:
+                continue
+            if treat_as_strings and isinstance(k, str):
+                ks = k.strip()
+                if ks:
+                    cleaned.append(ks)
+            else:
+                cleaned.append(k)
+        self.keys = cleaned[:10]
         self.state_key = state_key
         self.on_rotate = on_rotate
         idx = st.session_state.get(state_key, 0)
         self.idx = 0 if not self.keys else (idx % len(self.keys))
         st.session_state[state_key] = self.idx
-    def current(self) -> str | None:
+    def current(self):
         if not self.keys: return None
         return self.keys[self.idx % len(self.keys)]
     def rotate(self):
@@ -153,7 +217,7 @@ def with_retry(fn, tries=2, backoff=1.4):
             time.sleep((i + 1) * backoff)
 
 class RotatingYouTube:
-    def __init__(self, keys: list[str], state_key="yt_key_idx", log=None):
+    def __init__(self, keys, state_key="yt_key_idx", log=None):
         self.rot = RotatingKeys(keys, state_key, on_rotate=lambda i, k: log and log(f"🔁 YouTube 키 전환 → #{i+1}"))
         self.log = log
         self.service = None
@@ -183,7 +247,7 @@ def is_gemini_quota_error(exc: Exception) -> bool:
     msg = (str(exc) or "").lower()
     return ("429" in msg) or ("too many requests" in msg) or ("rate limit" in msg) or ("resource exhausted" in msg) or ("quota" in msg)
 
-def call_gemini_rotating(model_name: str, keys: list[str], system_instruction: str, user_payload: str,
+def call_gemini_rotating(model_name: str, keys, system_instruction: str, user_payload: str,
                          timeout_s: int = GEMINI_TIMEOUT, max_tokens: int = GEMINI_MAX_TOKENS, on_rotate=None) -> str:
     rot = RotatingKeys(keys, state_key="gem_key_idx", on_rotate=lambda i, k: on_rotate and on_rotate(i, k))
     if not rot.current():
@@ -451,18 +515,161 @@ def ensure_state():
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+
 ensure_state()
+
+# =============== (중요) 세션 불러오기 플래그 처리: 위젯 렌더 전 주입 ===============
+def _apply_loaded_session(sess_name: str):
+    """GitHub에서 파일 내려받아 session_state 채우고 즉시 재실행 전용."""
+    base = os.path.join(SESS_DIR, sess_name)
+    qa_file = os.path.join(base, "qa.json")
+    # 다운받기
+    github_download_file(GITHUB_REPO, GITHUB_BRANCH, f"sessions/{sess_name}/qa.json", GITHUB_TOKEN, qa_file)
+    for fn in ["simple_comments_full.csv","simple_comments_sample.csv","simple_videos.csv",
+               "adv_comments_full.csv","adv_comments_sample.csv","adv_videos.csv"]:
+        github_download_file(GITHUB_REPO, GITHUB_BRANCH, f"sessions/{sess_name}/{fn}", GITHUB_TOKEN, os.path.join(base, fn))
+    # 세션값 주입
+    if os.path.exists(qa_file):
+        with open(qa_file, encoding="utf-8") as f:
+            qa = json.load(f)
+        st.session_state["s_history"] = qa.get("simple_history", [])
+        st.session_state["adv_history"] = qa.get("adv_history", [])
+        st.session_state["s_query"] = qa.get("simple_query","")
+        st.session_state["last_keyword"] = qa.get("last_keyword","")
+        st.session_state["s_preset"] = qa.get("preset","최근 1년")
+        # 분석결과(최근) 복원
+        if st.session_state["s_history"]:
+            st.session_state["s_result_text"] = st.session_state["s_history"][-1][1]
+        if st.session_state["adv_history"]:
+            st.session_state["adv_result_text"] = st.session_state["adv_history"][-1][1]
+    # CSV 로드
+    def _read_csv(p):
+        if os.path.exists(p):
+            try:
+                return pd.read_csv(p)
+            except Exception:
+                return None
+        return None
+    st.session_state["s_df_comments"] = _read_csv(os.path.join(base,"simple_comments_full.csv"))
+    st.session_state["s_df_analysis"] = _read_csv(os.path.join(base,"simple_comments_sample.csv"))
+    st.session_state["s_df_stats"] = _read_csv(os.path.join(base,"simple_videos.csv"))
+    st.session_state["df_comments"] = _read_csv(os.path.join(base,"adv_comments_full.csv"))
+    st.session_state["df_analysis"] = _read_csv(os.path.join(base,"adv_comments_sample.csv"))
+    st.session_state["df_stats"] = _read_csv(os.path.join(base,"adv_videos.csv"))
+
+# pending 로드 처리
+if st.session_state.get("__pending_session_load"):
+    _apply_loaded_session(st.session_state["__pending_session_load"])
+    del st.session_state["__pending_session_load"]
+    st.success("세션을 불러왔습니다.")
+    st.rerun()
 
 # ===================== 히스토리 → 컨텍스트 =====================
 def build_history_context(pairs: list[tuple[str, str]]) -> str:
-    if not pairs: return ""
+    if not pairs:
+        return ""
     lines = []
     for i, (q, a) in enumerate(pairs, 1):
         lines.append(f"[이전 Q{i}]: {q}")
         lines.append(f"[이전 A{i}]: {a}")
     return "\n".join(lines)
 
-# ===================== 세션 저장/ZIP =====================
+# ===================== 시각화 도구(저장용) =====================
+def _fig_keyword_bubble(df_comments) -> go.Figure | None:
+    try:
+        custom_stopwords = {
+            "아","휴","아이구","아이쿠","아이고","어","나","우리","저희","따라","의해","을","를",
+            "에","의","가","으로","로","에게","뿐이다","의거하여","근거하여","입각하여","기준으로",
+            "그냥","댓글","영상","오늘","이제","뭐","진짜","정말","부분","요즘","제발","완전",
+            "그게","일단","모든","위해","대한","있지","이유","계속","실제","유튜브","이번","가장","드라마",
+        }
+        stopset = set(korean_stopwords); stopset.update(custom_stopwords)
+        query_kw = (st.session_state.get("s_query")
+                    or st.session_state.get("last_keyword")
+                    or st.session_state.get("adv_analysis_keyword")
+                    or "").strip()
+        if query_kw:
+            tokens_q = kiwi.tokenize(query_kw, normalize_coda=True)
+            query_words = [t.form for t in tokens_q if t.tag in ("NNG","NNP") and len(t.form) > 1]
+            stopset.update(query_words)
+
+        texts = " ".join(df_comments["text"].astype(str).tolist())
+        tokens = kiwi.tokenize(texts, normalize_coda=True)
+        words = [t.form for t in tokens if t.tag in ("NNG","NNP") and len(t.form) > 1 and t.form not in stopset]
+        counter = Counter(words)
+        if len(counter) == 0:
+            return None
+        df_kw = pd.DataFrame(counter.most_common(30), columns=["word", "count"])
+        df_kw["label"] = df_kw["word"] + "<br>" + df_kw["count"].astype(str)
+        df_kw["scaled"] = np.sqrt(df_kw["count"])
+        data_for_pack = [{"id": w, "datum": s} for w, s in zip(df_kw["word"], df_kw["scaled"])]
+        circles = circlify.circlify(data_for_pack, show_enclosure=False,
+                                    target_enclosure=circlify.Circle(x=0, y=0, r=1))
+        pos = {c.ex["id"]: (c.x, c.y, c.r) for c in circles if "id" in c.ex}
+        df_kw["x"] = df_kw["word"].map(lambda w: pos[w][0])
+        df_kw["y"] = df_kw["word"].map(lambda w: pos[w][1])
+        df_kw["r"] = df_kw["word"].map(lambda w: pos[w][2])
+        min_size, max_size = 10, 22
+        s_min, s_max = df_kw["scaled"].min(), df_kw["scaled"].max()
+        df_kw["font_size"] = df_kw["scaled"].apply(
+            lambda s: int(min_size + (s - s_min) / (s_max - s_min) * (max_size - min_size)) if s_max > s_min else 14
+        )
+        fig_kw = go.Figure()
+        palette = px.colors.sequential.Blues
+        df_kw["color_idx"] = df_kw["scaled"].apply(lambda s: int((s - s_min) / max(s_max - s_min, 1) * (len(palette) - 1)))
+        for _, row in df_kw.iterrows():
+            color = palette[int(row["color_idx"])]
+            fig_kw.add_shape(
+                type="circle", xref="x", yref="y",
+                x0=row["x"] - row["r"], y0=row["y"] - row["r"],
+                x1=row["x"] + row["r"], y1=row["y"] + row["r"],
+                line=dict(width=0), fillcolor=color, opacity=0.88, layer="below"
+            )
+        fig_kw.add_trace(go.Scatter(
+            x=df_kw["x"], y=df_kw["y"], mode="text",
+            text=df_kw["label"], textposition="middle center",
+            textfont=dict(color="white", size=df_kw["font_size"].tolist()),
+            hovertext=df_kw["word"] + " (" + df_kw["count"].astype(str) + ")",
+            hovertemplate="%{hovertext}<extra></extra>",
+        ))
+        fig_kw.update_xaxes(visible=False, range=[-1.05, 1.05])
+        fig_kw.update_yaxes(visible=False, range=[-1.05, 1.05], scaleanchor="x", scaleratio=1)
+        fig_kw.update_layout(title="Top30 키워드 버블", plot_bgcolor="rgba(0,0,0,0)", margin=dict(l=0, r=0, t=40, b=0))
+        return fig_kw
+    except Exception:
+        return None
+
+def _fig_time_series(df_comments, scope_label="(KST 기준)"):
+    df_time = df_comments.copy()
+    df_time["publishedAt"] = pd.to_datetime(df_time["publishedAt"], errors="coerce", utc=True).dt.tz_convert("Asia/Seoul")
+    df_time = df_time.dropna(subset=["publishedAt"])
+    if df_time.empty:
+        return None
+    span_hours = (df_time["publishedAt"].max() - df_time["publishedAt"].min()).total_seconds()/3600.0
+    rule = "H" if span_hours <= 48 else "D"
+    label = "시간별" if rule == "H" else "일자별"
+    ts = df_time.resample(rule, on="publishedAt").size().reset_index(name="count")
+    fig_ts = px.line(ts, x="publishedAt", y="count", markers=True, title=f"{label} 댓글량 추이 {scope_label}")
+    return fig_ts
+
+def _fig_top_videos(df_stats):
+    if df_stats is None or df_stats.empty:
+        return None
+    top_vids = df_stats.sort_values(by="commentCount", ascending=False).head(10).copy()
+    top_vids["title_short"] = top_vids["title"].apply(lambda t: t[:20] + "…" if isinstance(t, str) and len(t) > 20 else t)
+    fig_vids = px.bar(top_vids, x="commentCount", y="title_short", orientation="h", text="commentCount",
+                      title="Top10 영상 댓글수")
+    return fig_vids
+
+def _fig_top_authors(df_comments):
+    if df_comments is None or df_comments.empty:
+        return None
+    top_authors = (df_comments.groupby("author").size().reset_index(name="count").sort_values(by="count", ascending=False).head(10))
+    if top_authors.empty:
+        return None
+    fig_auth = px.bar(top_authors, x="count", y="author", orientation="h", text="count", title="Top10 댓글 작성자 활동량")
+    return fig_auth
+
 def _save_df_csv(df: pd.DataFrame, path: str):
     if df is None or (hasattr(df, "empty") and df.empty): return
     df.to_csv(path, index=False, encoding="utf-8-sig")
@@ -475,47 +682,61 @@ def _slugify_filename(s: str) -> str:
         s = "no_kw"
     return s[:60]
 
-def save_current_session(name_prefix: str | None = None):
-    # 제목 = YYYYMMDD_HHMMSS_검색어 (검색어: 심플 s_query 우선, 없으면 last_keyword)
-    kw = st.session_state.get("s_query") or st.session_state.get("last_keyword") or ""
-    kw_slug = _slugify_filename(kw)
-    sess_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{kw_slug}"
-    outdir = os.path.join(SESS_DIR, sess_id)
+def _build_session_name() -> str:
+    # 이름 포맷: 검색어_yyyy-mm-dd-hh:mm_검색기간 (KST)
+    kw = (st.session_state.get("s_query") or st.session_state.get("last_keyword") or "").strip() or "no_kw"
+    preset = (st.session_state.get("s_preset") or "최근 1년").replace(" ", "")
+    now_kst = datetime.now(_kst_tz()).strftime("%Y-%m-%d-%H:%M")
+    return f"{_slugify_filename(kw)}_{now_kst}_{preset}"
+
+def save_current_session():
+    # 세션 이름 및 로컬 저장
+    sess_name = _build_session_name()
+    outdir = os.path.join(SESS_DIR, sess_name)
     os.makedirs(outdir, exist_ok=True)
+
     qa_data = {
         "simple_history": st.session_state.get("s_history", []),
         "adv_history": st.session_state.get("adv_history", []),
         "simple_query": st.session_state.get("s_query",""),
         "last_keyword": st.session_state.get("last_keyword",""),
         "preset": st.session_state.get("s_preset",""),
-        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        "saved_at_kst": datetime.now(_kst_tz()).strftime("%Y-%m-%d %H:%M:%S")
     }
     with open(os.path.join(outdir, "qa.json"), "w", encoding="utf-8") as f:
         json.dump(qa_data, f, ensure_ascii=False, indent=2)
+
+    # CSV 저장
     _save_df_csv(st.session_state.get("s_df_comments"), os.path.join(outdir, "simple_comments_full.csv"))
     _save_df_csv(st.session_state.get("s_df_analysis"), os.path.join(outdir, "simple_comments_sample.csv"))
     _save_df_csv(st.session_state.get("s_df_stats"), os.path.join(outdir, "simple_videos.csv"))
     _save_df_csv(st.session_state.get("df_comments"), os.path.join(outdir, "adv_comments_full.csv"))
     _save_df_csv(st.session_state.get("df_analysis"), os.path.join(outdir, "adv_comments_sample.csv"))
     _save_df_csv(st.session_state.get("df_stats"), os.path.join(outdir, "adv_videos.csv"))
-    return sess_id
 
-def list_sessions():
-    if not os.path.exists(SESS_DIR): return []
-    return sorted([d for d in os.listdir(SESS_DIR) if os.path.isdir(os.path.join(SESS_DIR,d))], reverse=True)
+    # GitHub 업로드
+    uploaded = []
+    if GITHUB_TOKEN and GITHUB_REPO:
+        for fn in sorted(os.listdir(outdir)):
+            p = os.path.join(outdir, fn)
+            if os.path.isfile(p):
+                path_in_repo = f"sessions/{sess_name}/{fn}"
+                info = github_upload_file(GITHUB_REPO, GITHUB_BRANCH, path_in_repo, p, GITHUB_TOKEN)
+                uploaded.append(info)
 
-def zip_session(sess_id: str):
-    sess_path = os.path.join(SESS_DIR, sess_id)
-    zip_path = os.path.join(SESS_DIR, f"{sess_id}.zip")
-    shutil.make_archive(zip_path.replace(".zip",""), 'zip', sess_path)
-    return zip_path
+    return sess_name, uploaded
 
-# ===================== 시각화/다운로드 =====================
+def list_sessions_github():
+    if not (GITHUB_TOKEN and GITHUB_REPO):
+        return []
+    items = github_list_dir(GITHUB_REPO, GITHUB_BRANCH, "sessions", GITHUB_TOKEN)
+    return [x["name"] for x in items if isinstance(x, dict) and x.get("type") == "dir"]
+
+# ===================== 시각화/다운로드(화면 렌더) =====================
 def render_keyword_bubble(s_df_comments):
     st.subheader("① 키워드 버블")
     try:
         custom_stopwords = {
-            # (기존 커스텀 불용어 목록 예시 — 필요시 추가/수정)
             "아","휴","아이구","아이쿠","아이고","어","나","우리","저희","따라","의해","을","를",
             "에","의","가","으로","로","에게","뿐이다","의거하여","근거하여","입각하여","기준으로",
             "그냥","댓글","영상","오늘","이제","뭐","진짜","정말","부분","요즘","제발","완전",
@@ -661,7 +882,7 @@ def render_downloads(df_comments, df_analysis, df_stats, prefix="simple"):
             file_name=f"{prefix}_full_{len(df_comments)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
             mime="text/csv", key=f"{prefix}_dl_full_csv"
         )
-        if df_analysis is not None:
+        if df_analysis is not None and not df_analysis.empty:
             csv_sample = df_analysis.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
             st.download_button(
                 "분석용 샘플 (CSV)", data=csv_sample,
@@ -688,6 +909,8 @@ def handle_followup_simple():
     if not follow_q: return
     if not GEMINI_API_KEYS:
         st.error("Gemini API Key가 없습니다."); return
+    if not st.session_state.get("s_serialized_sample") and (st.session_state.get("s_df_analysis") is not None):
+        st.session_state["s_serialized_sample"] = serialize_comments_for_llm(st.session_state["s_df_analysis"])[0]
     if not st.session_state.get("s_serialized_sample"):
         st.error("분석 샘플이 없습니다. 먼저 수집/분석 실행."); return
     append_log("심플-추가", st.session_state.get("s_query",""), follow_q)  # no-op
@@ -705,6 +928,7 @@ def handle_followup_simple():
     )
     out = call_gemini_rotating(GEMINI_MODEL, GEMINI_API_KEYS, system_instruction, payload)
     st.session_state["s_history"].append((follow_q, out))
+    st.session_state["s_result_text"] = out
     st.session_state["simple_follow_q"] = ""
     st.success("추가 분석 완료")
 
@@ -732,6 +956,7 @@ def handle_followup_advanced():
     out = call_gemini_rotating(GEMINI_MODEL, GEMINI_API_KEYS, system_instruction, payload)
     st.session_state["adv_followups"].append((adv_follow_q, out))
     st.session_state["adv_history"].append((adv_follow_q, out))
+    st.session_state["adv_result_text"] = out
     st.session_state["adv_follow_q"] = ""
     st.success("추가 분석 완료(고급)")
 
@@ -883,8 +1108,8 @@ with tab_simple:
     render_downloads(s_df_comments, s_df_analysis, s_df_stats, prefix="simple")
 
     if st.button("💾 세션 저장하기", key="simple_save_session"):
-        sid = save_current_session(None)
-        st.success(f"세션 저장 완료: {sid}")
+        name, _ = save_current_session()
+        st.success(f"세션 저장 완료: {name}")
 
 # ===================== 2) 고급 모드 =====================
 with tab_advanced:
@@ -1138,59 +1363,62 @@ with tab_advanced:
                 st.button("질문 보내기(고급)", key="adv_follow_btn", on_click=handle_followup_advanced)
 
                 if st.button("💾 세션 저장하기", key="adv_save_session_analysis"):
-                    sid = save_current_session(None)
-                    st.success(f"세션 저장 완료: {sid}")
+                    name, _ = save_current_session()
+                    st.success(f"세션 저장 완료: {name}")
 
     render_quant_viz(st.session_state.get("df_comments"), st.session_state.get("df_stats"), scope_label="(KST 기준)")
     render_downloads(st.session_state.get("df_comments"), st.session_state.get("df_analysis"),
                      st.session_state.get("df_stats"), prefix=f"adv_{len(st.session_state.get('selected_ids', []))}vids")
 
     if st.button("💾 세션 저장하기", key="adv_save_session_comments"):
-        sid = save_current_session(None)
-        st.success(f"세션 저장 완료: {sid}")
+        name, _ = save_current_session()
+        st.success(f"세션 저장 완료: {name}")
 
-# ===================== 3) 세션 아카이브 =====================
+# ===================== 3) 세션 아카이브 (GitHub) =====================
 with tab_sessions:
-    st.subheader("저장된 세션 아카이브")
-    sess_list = list_sessions()
-    if not sess_list:
-        st.info("저장된 세션이 없습니다.")
+    st.subheader("저장된 세션 아카이브 ")
+
+    if not (GITHUB_TOKEN and GITHUB_REPO):
+        st.warning("⚠️ GitHub 설정이 비어 있습니다. st.secrets에 GITHUB_TOKEN / GITHUB_REPO / GITHUB_BRANCH를 넣어주세요.")
     else:
-        selected = st.selectbox("세션 선택", sess_list, key="sess_select")
-        sess_path = os.path.join(SESS_DIR, selected)
-        qa_file = os.path.join(sess_path, "qa.json")
-        if os.path.exists(qa_file):
-            with open(qa_file, encoding="utf-8") as f:
-                qa_data = json.load(f)
-            st.write("### 질문/응답")
-            for i,(q,a) in enumerate(qa_data.get("simple_history",[]),1):
-                with st.expander(f"[심플 Q{i}] {q}", expanded=False):
-                    st.markdown(a)
-            for i,(q,a) in enumerate(qa_data.get("adv_history",[]),1):
-                with st.expander(f"[고급 Q{i}] {q}", expanded=False):
-                    st.markdown(a)
-        if st.button("📦 ZIP 만들기/새로고침", key="sess_zip_build"):
-            zip_session(selected); st.success("ZIP 생성/갱신 완료")
-        zip_path = os.path.join(SESS_DIR, f"{selected}.zip")
-        if os.path.exists(zip_path):
-            with open(zip_path, "rb") as f:
-                st.download_button("⬇️ 세션 전체 다운로드 (ZIP)", data=f.read(), file_name=f"{selected}.zip")
-        st.write("### 세션 폴더 파일 (CSV/JSON)")
-        for fn in sorted(os.listdir(sess_path)):
-            p = os.path.join(sess_path, fn)
-            if os.path.isfile(p):
-                with open(p, "rb") as f:
-                    st.download_button(f"⬇️ {fn}", data=f.read(), file_name=fn, key=f"dl_{selected}_{fn}")
+        session_dirs = list_sessions_github()
+        if not session_dirs:
+            st.info("저장된 세션이 없습니다.")
+        else:
+            selected_name = st.selectbox("세션 선택", session_dirs, key="sess_select_github")
+            if selected_name:
+                c1, c2 = st.columns([1,3])
+                if c1.button("📂 이 세션 불러오기", key="btn_load_session"):
+                    # 위젯 생성 전 세션 주입을 위해 플래그 세팅 후 rerun
+                    st.session_state["__pending_session_load"] = selected_name
+                    st.rerun()
+
+                # CSV 바로 다운로드 링크(원하는 3개 중심, adv는 있으면 노출)
+                st.markdown("### ⬇️ 세션 내 CSV 바로 다운로드")
+                def _csv_dl(fn):
+                    # raw URL
+                    raw_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_BRANCH}/sessions/{selected_name}/{fn}"
+                    local = os.path.join(SESS_DIR, selected_name, fn)
+                    ok = github_download_file(GITHUB_REPO, GITHUB_BRANCH, f"sessions/{selected_name}/{fn}", GITHUB_TOKEN, local)
+                    colL, colR = st.columns([6,1])
+                    with colL:
+                        st.markdown(f"- **{fn}** · [🔗 Raw로 열기]({raw_url})")
+                    with colR:
+                        if ok and os.path.exists(local):
+                            with open(local, "rb") as f:
+                                st.download_button("다운로드", data=f.read(), file_name=fn, key=f"dl_{selected_name}_{fn}")
+                        else:
+                            st.caption("파일 없음")
+
+                _csv_dl("simple_comments_full.csv")
+                _csv_dl("simple_comments_sample.csv")
+                _csv_dl("simple_videos.csv")
+                _csv_dl("adv_comments_full.csv")
+                _csv_dl("adv_comments_sample.csv")
+                _csv_dl("adv_videos.csv")
 
 # ===================== 초기화 버튼 =====================
 st.markdown("---")
 if st.button("🔄 초기화 하기", type="secondary"):
-    for k in list(st.session_state.keys()):
-        del st.session_state[k]
+    st.session_state.clear()
     st.rerun()
-
-
-
-
-
-
