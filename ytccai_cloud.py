@@ -1113,7 +1113,7 @@ with tab_simple:
 
 # ===================== 2) 고급 모드 =====================
 with tab_advanced:
-    st.subheader("고급 모드 — 4단계로 세밀 제어 (심플과 동등 로직/시각화)")
+    st.subheader("고급 모드")
 
     mode = st.radio("모드", ["검색 모드", "URL 직접 입력 모드"],
                     index=(0 if st.session_state.get("mode", "검색 모드") == "검색 모드" else 1),
@@ -1422,3 +1422,4 @@ st.markdown("---")
 if st.button("🔄 초기화 하기", type="secondary"):
     st.session_state.clear()
     st.rerun()
+
