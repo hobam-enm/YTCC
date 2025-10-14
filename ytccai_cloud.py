@@ -1,11 +1,18 @@
+# -*- coding: utf-8 -*-
 # 📊 유튜브 반응 리포트: AI 댓글요약 (Streamlit Cloud용 / GitHub 세션 아카이브)
+# - 메모리 최적화: 댓글 수집을 CSV로 스트리밍 저장 (DataFrame 메모리 피크 방지)
+# - 시각화: CSV 청크 집계(시간대/일자별, 키워드 버블, 작성자 Top10, 좋아요 Top10)
+# - 탭 내비 및 세션 로드 안정화: safe_rerun() 래퍼로 Streamlit 버전 차 안전 대응
+# - 고급 모드: AI 분석 완료 후에만 정량요약 표시(중첩 expander 방지)
 
 import streamlit as st
 import pandas as pd
-import io, os, json, re, time, shutil, traceback, base64, requests
+import os, json, re, time, base64, requests, gc
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, parse_qs
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import Counter
+from uuid import uuid4
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -16,7 +23,6 @@ import plotly.express as px
 from plotly import graph_objects as go
 import circlify
 import stopwordsiso as stopwords
-from collections import Counter
 from kiwipiepy import Kiwi
 import numpy as np
 
@@ -25,13 +31,22 @@ try:
 except Exception:
     ILLEGAL_CHARACTERS_RE = None
 
+# --- Streamlit rerun 호환 래퍼 ---
+def safe_rerun():
+    fn = getattr(st, "rerun", None)
+    if callable(fn):
+        return fn()
+    fn_old = getattr(st, "experimental_rerun", None)
+    if callable(fn_old):
+        return fn_old()
+    raise RuntimeError("No rerun function available in this Streamlit build.")
+
 # ===================== 기본 경로(Cloud) =====================
 BASE_DIR = "/tmp"  # Streamlit Cloud는 /tmp만 쓰기 가능(휘발성)
 SESS_DIR = os.path.join(BASE_DIR, "sessions")
 os.makedirs(SESS_DIR, exist_ok=True)
 
 # ===================== 비밀키 / 파라미터 =====================
-# secrets 우선, 없으면 하드코딩 백업
 _YT_FALLBACK = []
 _GEM_FALLBACK = []
 
@@ -58,23 +73,16 @@ def github_upload_file(repo, branch, path_in_repo, local_path, token):
     with open(local_path, "rb") as f:
         content = base64.b64encode(f.read()).decode("utf-8")
     headers = _gh_headers(token)
-    # 기존 sha 확인
     get_resp = requests.get(url + f"?ref={branch}", headers=headers)
     sha = get_resp.json().get("sha") if get_resp.status_code == 200 else None
-    data = {
-        "message": f"upload {path_in_repo}",
-        "content": content,
-        "branch": branch,
-    }
-    if sha:
-        data["sha"] = sha
+    data = {"message": f"upload {path_in_repo}", "content": content, "branch": branch}
+    if sha: data["sha"] = sha
     resp = requests.put(url, headers=headers, json=data)
     if resp.status_code not in (200, 201):
         raise RuntimeError(f"GitHub 업로드 실패: {resp.text}")
     return resp.json()
 
 def github_list_dir(repo, branch, folder, token):
-    """GET /repos/{owner}/{repo}/contents/{folder}"""
     url = f"https://api.github.com/repos/{repo}/contents/{folder}?ref={branch}"
     headers = _gh_headers(token)
     resp = requests.get(url, headers=headers)
@@ -83,7 +91,6 @@ def github_list_dir(repo, branch, folder, token):
     return resp.json()
 
 def github_download_file(repo, branch, path_in_repo, token, local_path):
-    """GET /repos/{owner}/{repo}/contents/{path}"""
     url = f"https://api.github.com/repos/{repo}/contents/{path_in_repo}?ref={branch}"
     headers = _gh_headers(token)
     resp = requests.get(url, headers=headers)
@@ -104,7 +111,6 @@ MAX_COMMENTS_PER_VIDEO = 5_000
 LOCK_PATH = os.path.join(BASE_DIR, "ytccai.busy.lock")
 
 def try_acquire_lock(ttl=7200):
-    # 오래된 락 정리
     if os.path.exists(LOCK_PATH):
         try:
             if time.time() - os.path.getmtime(LOCK_PATH) > ttl:
@@ -128,7 +134,6 @@ def release_lock():
         pass
 
 def lock_guard_start_or_warn():
-    """긴 작업 시작 전에 호출: 락을 잡고 True 반환, 실패시 경고 후 False"""
     if not try_acquire_lock():
         st.warning("다른 사용자가 작업 중입니다. 잠시 후 다시 시도하세요.")
         return False
@@ -150,25 +155,31 @@ def clean_illegal(val):
         return ILLEGAL_CHARACTERS_RE.sub('', val)
     return val
 
+def clean_df_strings(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty: return df
+    obj_cols = df.select_dtypes(include=["object"]).columns.tolist()
+    if not obj_cols: return df
+    df2 = df.copy()
+    for c in obj_cols:
+        df2[c] = df2[c].map(clean_illegal)
+    return df2
+
 # ===================== 형태소/불용어 =====================
 kiwi = Kiwi()
 korean_stopwords = stopwords.stopwords("ko")
 
-# ===================== (로그 제거) append_log → no-op =====================
-def append_log(*args, **kwargs):
-    return
+# ===================== 로그 no-op =====================
+def append_log(*args, **kwargs): return
 
-# ===================== 키 로테이터 (범용화) =====================
+# ===================== 키 로테이터 =====================
 class RotatingKeys:
     def __init__(self, keys, state_key: str, on_rotate=None, treat_as_strings: bool = True):
         cleaned = []
         for k in (keys or []):
-            if k is None:
-                continue
+            if k is None: continue
             if treat_as_strings and isinstance(k, str):
                 ks = k.strip()
-                if ks:
-                    cleaned.append(ks)
+                if ks: cleaned.append(ks)
             else:
                 cleaned.append(k)
         self.keys = cleaned[:10]
@@ -247,8 +258,15 @@ def is_gemini_quota_error(exc: Exception) -> bool:
     msg = (str(exc) or "").lower()
     return ("429" in msg) or ("too many requests" in msg) or ("rate limit" in msg) or ("resource exhausted" in msg) or ("quota" in msg)
 
-def call_gemini_rotating(model_name: str, keys, system_instruction: str, user_payload: str,
-                         timeout_s: int = GEMINI_TIMEOUT, max_tokens: int = GEMINI_MAX_TOKENS, on_rotate=None) -> str:
+def call_gemini_rotating(
+    model_name: str,
+    keys,
+    system_instruction: str,
+    user_payload: str,
+    timeout_s: int = GEMINI_TIMEOUT,
+    max_tokens: int = GEMINI_MAX_TOKENS,
+    on_rotate=None
+) -> str:
     rot = RotatingKeys(keys, state_key="gem_key_idx", on_rotate=lambda i, k: on_rotate and on_rotate(i, k))
     if not rot.current():
         raise RuntimeError("Gemini API Key가 비어 있습니다.")
@@ -265,11 +283,11 @@ def call_gemini_rotating(model_name: str, keys, system_instruction: str, user_pa
                                           request_options={"timeout": timeout_s})
             out = getattr(resp, "text", None)
             if not out and hasattr(resp, "candidates") and resp.candidates:
-                c = resp.candidates[0]
-                if hasattr(c, "content") and getattr(c.content, "parts", None):
-                    part = c.content.parts[0]
-                    if hasattr(part, "text"):
-                        out = part.text
+                c0 = resp.candidates[0]
+                if hasattr(c0, "content") and getattr(c0.content, "parts", None):
+                    p0 = c0.content.parts[0]
+                    if hasattr(p0, "text"):
+                        out = p0.text
             return out or ""
         except Exception as e:
             if is_gemini_quota_error(e) and len(rot.keys) > 1:
@@ -308,36 +326,32 @@ def extract_video_ids_from_text(text: str):
             ids.append(vid)
     return ids
 
-# ===================== 직렬화/샘플링 =====================
-def sample_max_5000(df: pd.DataFrame) -> pd.DataFrame:
-    n = len(df)
-    if n <= 5000:
-        return df.copy().reset_index(drop=True)
-    try:
-        return df.nlargest(5000, "likeCount").reset_index(drop=True)
-    except Exception:
-        return df.head(5000).reset_index(drop=True)
-
-def serialize_comments_for_llm(df: pd.DataFrame, max_rows=1500, max_chars_per_comment=280, max_total_chars=450_000):
-    if df is None or df.empty:
+# ===================== 직렬화(LLM) from CSV(청크) =====================
+def serialize_comments_for_llm_from_file(csv_path: str, max_rows=1500, max_chars_per_comment=280, max_total_chars=450_000):
+    if not csv_path or not os.path.exists(csv_path):
         return "", 0, 0
-    try:
-        df2 = df.nlargest(max_rows, "likeCount") if "likeCount" in df.columns else df.head(max_rows)
-    except Exception:
-        df2 = df.head(max_rows)
     lines, total = [], 0
-    for _, r in df2.iterrows():
-        is_reply = "R" if int(r.get("isReply", 0) or 0) == 1 else "T"
-        author = str(r.get("author", "") or "").replace("\n", " ")
-        likec = int(r.get("likeCount", 0) or 0)
-        text = str(r.get("text", "") or "").replace("\n", " ")
-        if len(text) > max_chars_per_comment:
-            text = text[:max_chars_per_comment] + "…"
-        line = f"[{is_reply}|♥{likec}] {author}: {text}"
-        if total + len(line) + 1 > max_total_chars:
+    remaining = max_rows
+    for chunk in pd.read_csv(csv_path, chunksize=100_000):
+        if "likeCount" in chunk.columns:
+            chunk = chunk.sort_values("likeCount", ascending=False)
+        for _, r in chunk.iterrows():
+            if remaining <= 0 or total >= max_total_chars:
+                break
+            is_reply = "R" if int(r.get("isReply", 0) or 0) == 1 else "T"
+            author = str(r.get("author", "") or "").replace("\n", " ")
+            likec = int(r.get("likeCount", 0) or 0)
+            text = str(r.get("text", "") or "").replace("\n", " ")
+            if len(text) > max_chars_per_comment:
+                text = text[:max_chars_per_comment] + "…"
+            line = f"[{is_reply}|♥{likec}] {author}: {text}"
+            if total + len(line) + 1 > max_total_chars:
+                break
+            lines.append(line)
+            total += len(line) + 1
+            remaining -= 1
+        if remaining <= 0 or total >= max_total_chars:
             break
-        lines.append(line)
-        total += len(line) + 1
     return "\n".join(lines), len(lines), total
 
 # ===================== YouTube API 함수 =====================
@@ -460,11 +474,17 @@ def yt_all_comments_sync(rt, video_id, title="", short_type="Clip", include_repl
         time.sleep(0.25)
     return rows
 
-def parallel_collect_comments(video_list, rt_keys, include_replies, max_total_comments, max_per_video, log_callback, prog_callback):
-    all_comments = []
+# ===================== 댓글 수집: 스트리밍 저장 =====================
+def parallel_collect_comments_streaming(
+    video_list, rt_keys, include_replies, max_total_comments, max_per_video,
+    log_callback=None, prog_callback=None
+):
+    out_csv = os.path.join(BASE_DIR, f"collect_{uuid4().hex}.csv")
+    wrote_header = False
+    total_written = 0
     total_videos = len(video_list)
-    collected_videos = 0
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    done_videos = 0
+    with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {
             executor.submit(
                 yt_all_comments_sync,
@@ -477,40 +497,51 @@ def parallel_collect_comments(video_list, rt_keys, include_replies, max_total_co
                 max_per_video
             ): vid_info for vid_info in video_list
         }
-        for future in as_completed(futures):
-            vid_info = futures[future]
+        for fut in as_completed(futures):
+            vid_info = futures[fut]
             try:
-                comments = future.result()
-                all_comments.extend(comments)
-                collected_videos += 1
-                if log_callback: log_callback(f"✅ [{collected_videos}/{total_videos}] {vid_info.get('title','')} - {len(comments):,}개 수집")
-                if prog_callback: prog_callback(collected_videos / total_videos)
+                comments = fut.result()
+                if comments:
+                    df_chunk = pd.DataFrame(comments)
+                    df_chunk = clean_df_strings(df_chunk)
+                    df_chunk.to_csv(
+                        out_csv, index=False,
+                        mode=("a" if wrote_header else "w"),
+                        header=(not wrote_header),
+                        encoding="utf-8-sig"
+                    )
+                    wrote_header = True
+                    total_written += len(df_chunk)
+                done_videos += 1
+                if log_callback: log_callback(f"✅ [{done_videos}/{total_videos}] {vid_info.get('title','')} - {len(comments):,}개 수집")
+                if prog_callback: prog_callback(done_videos / total_videos)
             except Exception as e:
-                if log_callback: log_callback(f"❌ [{collected_videos+1}/{total_videos}] {vid_info.get('title','')} - 실패: {e}")
-                collected_videos += 1
-                if prog_callback: prog_callback(collected_videos / total_videos)
-            if len(all_comments) >= max_total_comments:
+                done_videos += 1
+                if log_callback: log_callback(f"❌ [{done_videos}/{total_videos}] {vid_info.get('title','')} - 실패: {e}")
+                if prog_callback: prog_callback(done_videos / total_videos)
+            if total_written >= max_total_comments:
                 if log_callback: log_callback(f"최대 수집 한도({max_total_comments:,}개) 도달, 중단")
                 break
-    return all_comments[:max_total_comments]
+    return out_csv, total_written
 
-# ===================== 세션 상태 =====================
+# ===================== 세션 상태 & 로드 =====================
 def ensure_state():
     defaults = dict(
         focus_step=1,
         last_keyword="",
         # 심플
-        s_query="", s_df_comments=None, s_df_analysis=None, s_df_stats=None,
+        s_query="", s_comments_path="", s_df_stats=None,
         s_serialized_sample="", s_result_text="",
-        s_history=[], s_preset="최근 1년",
+        s_history=[], s_preset="최근 1년", s_total_count=0,
         # 고급
         mode="검색 모드",
         df_stats=None, selected_ids=[],
-        df_comments=None, df_analysis=None,
-        adv_serialized_sample="", adv_result_text="",
-        adv_followups=[], adv_history=[],
+        adv_comments_path="", adv_serialized_sample="", adv_result_text="",
+        adv_followups=[], adv_history=[], adv_total_count=0,
         # 입력값
         simple_follow_q="", adv_follow_q="",
+        # 탭 표시값
+        last_tab="심플",
     )
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -518,16 +549,19 @@ def ensure_state():
 
 ensure_state()
 
-# =============== (중요) 세션 불러오기 플래그 처리: 위젯 렌더 전 주입 ===============
 def _apply_loaded_session(sess_name: str):
-    """GitHub에서 파일 내려받아 session_state 채우고 즉시 재실행 전용."""
     base = os.path.join(SESS_DIR, sess_name)
     qa_file = os.path.join(base, "qa.json")
-    # 다운받기
+
+    # 다운로드
     github_download_file(GITHUB_REPO, GITHUB_BRANCH, f"sessions/{sess_name}/qa.json", GITHUB_TOKEN, qa_file)
-    for fn in ["simple_comments_full.csv","simple_comments_sample.csv","simple_videos.csv",
-               "adv_comments_full.csv","adv_comments_sample.csv","adv_videos.csv"]:
-        github_download_file(GITHUB_REPO, GITHUB_BRANCH, f"sessions/{sess_name}/{fn}", GITHUB_TOKEN, os.path.join(base, fn))
+    for fn in ["simple_comments_full.csv","simple_comments_full.csv.gz","simple_videos.csv",
+               "adv_comments_full.csv","adv_comments_full.csv.gz","adv_videos.csv"]:
+        try:
+            github_download_file(GITHUB_REPO, GITHUB_BRANCH, f"sessions/{sess_name}/{fn}", GITHUB_TOKEN, os.path.join(base, fn))
+        except:
+            pass
+
     # 세션값 주입
     if os.path.exists(qa_file):
         with open(qa_file, encoding="utf-8") as f:
@@ -537,32 +571,54 @@ def _apply_loaded_session(sess_name: str):
         st.session_state["s_query"] = qa.get("simple_query","")
         st.session_state["last_keyword"] = qa.get("last_keyword","")
         st.session_state["s_preset"] = qa.get("preset","최근 1년")
-        # 분석결과(최근) 복원
+        st.session_state["last_tab"] = qa.get("last_tab", "심플")
         if st.session_state["s_history"]:
             st.session_state["s_result_text"] = st.session_state["s_history"][-1][1]
         if st.session_state["adv_history"]:
             st.session_state["adv_result_text"] = st.session_state["adv_history"][-1][1]
-    # CSV 로드
-    def _read_csv(p):
-        if os.path.exists(p):
-            try:
-                return pd.read_csv(p)
-            except Exception:
-                return None
-        return None
-    st.session_state["s_df_comments"] = _read_csv(os.path.join(base,"simple_comments_full.csv"))
-    st.session_state["s_df_analysis"] = _read_csv(os.path.join(base,"simple_comments_sample.csv"))
-    st.session_state["s_df_stats"] = _read_csv(os.path.join(base,"simple_videos.csv"))
-    st.session_state["df_comments"] = _read_csv(os.path.join(base,"adv_comments_full.csv"))
-    st.session_state["df_analysis"] = _read_csv(os.path.join(base,"adv_comments_sample.csv"))
-    st.session_state["df_stats"] = _read_csv(os.path.join(base,"adv_videos.csv"))
 
-# pending 로드 처리
-if st.session_state.get("__pending_session_load"):
-    _apply_loaded_session(st.session_state["__pending_session_load"])
+    def _first_existing(*names):
+        for n in names:
+            p = os.path.join(base, n)
+            if os.path.exists(p): return p
+        return ""
+
+    st.session_state["s_comments_path"] = _first_existing("simple_comments_full.csv.gz","simple_comments_full.csv")
+    s_videos_path = os.path.join(base,"simple_videos.csv")
+    st.session_state["s_df_stats"] = pd.read_csv(s_videos_path) if os.path.exists(s_videos_path) else None
+
+    st.session_state["adv_comments_path"] = _first_existing("adv_comments_full.csv.gz","adv_comments_full.csv")
+    a_videos_path = os.path.join(base,"adv_videos.csv")
+    st.session_state["df_stats"] = pd.read_csv(a_videos_path) if os.path.exists(a_videos_path) else None
+
+# --- 탭 내비 유틸 ---
+def consume_next_tab(default_val: str = "심플") -> str:
+    if "__next_tab" in st.session_state:
+        val = st.session_state["__next_tab"]
+        del st.session_state["__next_tab"]
+        return val
+    return st.session_state.get("last_tab", default_val)
+
+# --- (라디오 생성 전) pending 로드 처리 ---
+if "__pending_session_load" in st.session_state:
+    target = st.session_state["__pending_session_load"]
     del st.session_state["__pending_session_load"]
+    _apply_loaded_session(target)
+    st.session_state["__next_tab"] = st.session_state.get("last_tab", "심플")
     st.success("세션을 불러왔습니다.")
-    st.rerun()
+    safe_rerun()
+
+# 상단 탭(라디오)
+default_tab = consume_next_tab(default_val=st.session_state.get("last_tab","심플"))
+tab = st.radio(
+    "화면",
+    ["심플", "고급", "세션"],
+    index=["심플","고급","세션"].index(default_tab),
+    horizontal=True,
+    key="tab"
+)
+if st.session_state.get("last_tab") != tab:
+    st.session_state["last_tab"] = tab
 
 # ===================== 히스토리 → 컨텍스트 =====================
 def build_history_context(pairs: list[tuple[str, str]]) -> str:
@@ -574,123 +630,194 @@ def build_history_context(pairs: list[tuple[str, str]]) -> str:
         lines.append(f"[이전 A{i}]: {a}")
     return "\n".join(lines)
 
-# ===================== 시각화 도구(저장용) =====================
-def _fig_keyword_bubble(df_comments) -> go.Figure | None:
-    try:
-        custom_stopwords = {
-            "아","휴","아이구","아이쿠","아이고","어","나","우리","저희","따라","의해","을","를",
-            "에","의","가","으로","로","에게","뿐이다","의거하여","근거하여","입각하여","기준으로",
-            "그냥","댓글","영상","오늘","이제","뭐","진짜","정말","부분","요즘","제발","완전",
-            "그게","일단","모든","위해","대한","있지","이유","계속","실제","유튜브","이번","가장","드라마",
-        }
-        stopset = set(korean_stopwords); stopset.update(custom_stopwords)
-        query_kw = (st.session_state.get("s_query")
-                    or st.session_state.get("last_keyword")
-                    or st.session_state.get("adv_analysis_keyword")
-                    or "").strip()
-        if query_kw:
-            tokens_q = kiwi.tokenize(query_kw, normalize_coda=True)
-            query_words = [t.form for t in tokens_q if t.tag in ("NNG","NNP") and len(t.form) > 1]
-            stopset.update(query_words)
-
-        texts = " ".join(df_comments["text"].astype(str).tolist())
-        tokens = kiwi.tokenize(texts, normalize_coda=True)
+# ===================== 키워드 Counter (CSV 청크) =====================
+@st.cache_data(ttl=600, show_spinner=False)
+def compute_keyword_counter_from_file(csv_path: str, stopset_list: list[str], per_comment_cap: int = 200) -> list[tuple[str,int]]:
+    if not csv_path or not os.path.exists(csv_path):
+        return []
+    stopset = set(stopset_list)
+    counter = Counter()
+    for chunk in pd.read_csv(csv_path, usecols=["text"], chunksize=100_000):
+        texts = (chunk["text"].astype(str).str.slice(0, per_comment_cap)).tolist()
+        if not texts:
+            continue
+        tokens = kiwi.tokenize(" ".join(texts), normalize_coda=True)
         words = [t.form for t in tokens if t.tag in ("NNG","NNP") and len(t.form) > 1 and t.form not in stopset]
-        counter = Counter(words)
-        if len(counter) == 0:
-            return None
-        df_kw = pd.DataFrame(counter.most_common(30), columns=["word", "count"])
-        df_kw["label"] = df_kw["word"] + "<br>" + df_kw["count"].astype(str)
-        df_kw["scaled"] = np.sqrt(df_kw["count"])
-        data_for_pack = [{"id": w, "datum": s} for w, s in zip(df_kw["word"], df_kw["scaled"])]
-        circles = circlify.circlify(data_for_pack, show_enclosure=False,
-                                    target_enclosure=circlify.Circle(x=0, y=0, r=1))
-        pos = {c.ex["id"]: (c.x, c.y, c.r) for c in circles if "id" in c.ex}
-        df_kw["x"] = df_kw["word"].map(lambda w: pos[w][0])
-        df_kw["y"] = df_kw["word"].map(lambda w: pos[w][1])
-        df_kw["r"] = df_kw["word"].map(lambda w: pos[w][2])
-        min_size, max_size = 10, 22
-        s_min, s_max = df_kw["scaled"].min(), df_kw["scaled"].max()
-        df_kw["font_size"] = df_kw["scaled"].apply(
-            lambda s: int(min_size + (s - s_min) / (s_max - s_min) * (max_size - min_size)) if s_max > s_min else 14
-        )
-        fig_kw = go.Figure()
-        palette = px.colors.sequential.Blues
-        df_kw["color_idx"] = df_kw["scaled"].apply(lambda s: int((s - s_min) / max(s_max - s_min, 1) * (len(palette) - 1)))
-        for _, row in df_kw.iterrows():
-            color = palette[int(row["color_idx"])]
-            fig_kw.add_shape(
-                type="circle", xref="x", yref="y",
-                x0=row["x"] - row["r"], y0=row["y"] - row["r"],
-                x1=row["x"] + row["r"], y1=row["y"] + row["r"],
-                line=dict(width=0), fillcolor=color, opacity=0.88, layer="below"
-            )
-        fig_kw.add_trace(go.Scatter(
-            x=df_kw["x"], y=df_kw["y"], mode="text",
-            text=df_kw["label"], textposition="middle center",
-            textfont=dict(color="white", size=df_kw["font_size"].tolist()),
-            hovertext=df_kw["word"] + " (" + df_kw["count"].astype(str) + ")",
-            hovertemplate="%{hovertext}<extra></extra>",
-        ))
-        fig_kw.update_xaxes(visible=False, range=[-1.05, 1.05])
-        fig_kw.update_yaxes(visible=False, range=[-1.05, 1.05], scaleanchor="x", scaleratio=1)
-        fig_kw.update_layout(title="Top30 키워드 버블", plot_bgcolor="rgba(0,0,0,0)", margin=dict(l=0, r=0, t=40, b=0))
-        return fig_kw
-    except Exception:
-        return None
+        counter.update(words)
+    return counter.most_common(300)
 
-def _fig_time_series(df_comments, scope_label="(KST 기준)"):
-    df_time = df_comments.copy()
-    df_time["publishedAt"] = pd.to_datetime(df_time["publishedAt"], errors="coerce", utc=True).dt.tz_convert("Asia/Seoul")
-    df_time = df_time.dropna(subset=["publishedAt"])
-    if df_time.empty:
+def keyword_bubble_figure_from_counter(counter_items: list[tuple[str,int]]) -> go.Figure | None:
+    if not counter_items:
         return None
-    span_hours = (df_time["publishedAt"].max() - df_time["publishedAt"].min()).total_seconds()/3600.0
-    rule = "H" if span_hours <= 48 else "D"
-    label = "시간별" if rule == "H" else "일자별"
-    ts = df_time.resample(rule, on="publishedAt").size().reset_index(name="count")
-    fig_ts = px.line(ts, x="publishedAt", y="count", markers=True, title=f"{label} 댓글량 추이 {scope_label}")
-    return fig_ts
+    df_kw = pd.DataFrame(counter_items[:30], columns=["word", "count"])
+    df_kw["label"] = df_kw["word"] + "<br>" + df_kw["count"].astype(str)
+    df_kw["scaled"] = np.sqrt(df_kw["count"])
+    circles = circlify.circlify(
+        [{"id": w, "datum": s} for w, s in zip(df_kw["word"], df_kw["scaled"])],
+        show_enclosure=False,
+        target_enclosure=circlify.Circle(x=0, y=0, r=1)
+    )
+    pos = {c.ex["id"]: (c.x, c.y, c.r) for c in circles if "id" in c.ex}
+    df_kw["x"] = df_kw["word"].map(lambda w: pos[w][0])
+    df_kw["y"] = df_kw["word"].map(lambda w: pos[w][1])
+    df_kw["r"] = df_kw["word"].map(lambda w: pos[w][2])
+    s_min, s_max = df_kw["scaled"].min(), df_kw["scaled"].max()
+    df_kw["font_size"] = df_kw["scaled"].apply(lambda s: int(10 + (s - s_min) / max(s_max - s_min, 1) * 12))
+    fig_kw = go.Figure()
+    palette = px.colors.sequential.Blues
+    df_kw["color_idx"] = df_kw["scaled"].apply(lambda s: int((s - s_min) / max(s_max - s_min, 1) * (len(palette) - 1)))
+    for _, row in df_kw.iterrows():
+        color = palette[int(row["color_idx"])]
+        fig_kw.add_shape(type="circle", xref="x", yref="y",
+                         x0=row["x"] - row["r"], y0=row["y"] - row["r"],
+                         x1=row["x"] + row["r"], y1=row["y"] + row["r"],
+                         line=dict(width=0), fillcolor=color, opacity=0.88, layer="below")
+    fig_kw.add_trace(go.Scatter(
+        x=df_kw["x"], y=df_kw["y"], mode="text",
+        text=df_kw["label"], textposition="middle center",
+        textfont=dict(color="white", size=df_kw["font_size"].tolist()),
+        hovertext=df_kw["word"] + " (" + df_kw["count"].astype(str) + ")",
+        hovertemplate="%{hovertext}<extra></extra>",
+    ))
+    fig_kw.update_xaxes(visible=False, range=[-1.05, 1.05])
+    fig_kw.update_yaxes(visible=False, range=[-1.05, 1.05], scaleanchor="x", scaleratio=1)
+    fig_kw.update_layout(title="Top30 키워드 버블", plot_bgcolor="rgba(0,0,0,0)", margin=dict(l=0, r=0, t=40, b=0))
+    return fig_kw
 
-def _fig_top_videos(df_stats):
-    if df_stats is None or df_stats.empty:
-        return None
-    top_vids = df_stats.sort_values(by="commentCount", ascending=False).head(10).copy()
-    top_vids["title_short"] = top_vids["title"].apply(lambda t: t[:20] + "…" if isinstance(t, str) and len(t) > 20 else t)
-    fig_vids = px.bar(top_vids, x="commentCount", y="title_short", orientation="h", text="commentCount",
-                      title="Top10 영상 댓글수")
-    return fig_vids
+# ===================== 정량 시각화: CSV 청크 집계 =====================
+def timeseries_from_file(csv_path: str):
+    if not csv_path or not os.path.exists(csv_path): return None, None
+    tmin = None; tmax = None
+    for chunk in pd.read_csv(csv_path, usecols=["publishedAt"], chunksize=200_000):
+        dt = pd.to_datetime(chunk["publishedAt"], errors="coerce", utc=True)
+        if dt.notna().any():
+            lo, hi = dt.min(), dt.max()
+            tmin = lo if (tmin is None or (lo < tmin)) else tmin
+            tmax = hi if (tmax is None or (hi > tmax)) else tmax
+    if tmin is None or tmax is None:
+        return None, None
+    span_hours = (tmax - tmin).total_seconds()/3600.0
+    use_hour = (span_hours <= 48)
 
-def _fig_top_authors(df_comments):
-    if df_comments is None or df_comments.empty:
-        return None
-    top_authors = (df_comments.groupby("author").size().reset_index(name="count").sort_values(by="count", ascending=False).head(10))
-    if top_authors.empty:
-        return None
-    fig_auth = px.bar(top_authors, x="count", y="author", orientation="h", text="count", title="Top10 댓글 작성자 활동량")
-    return fig_auth
+    agg = {}
+    for chunk in pd.read_csv(csv_path, usecols=["publishedAt"], chunksize=200_000):
+        dt = pd.to_datetime(chunk["publishedAt"], errors="coerce", utc=True).dt.tz_convert("Asia/Seoul")
+        dt = dt.dropna()
+        if dt.empty: continue
+        bucket = (dt.dt.floor("H") if use_hour else dt.dt.floor("D"))
+        vc = bucket.value_counts()
+        for t, c in vc.items():
+            agg[t] = agg.get(t, 0) + int(c)
+    # pandas 구버전 호환 (names= 미지원)
+    ts = pd.Series(agg).sort_index().rename("count").reset_index().rename(columns={"index":"bucket"})
+    return ts, ("시간별" if use_hour else "일자별")
 
-def _save_df_csv(df: pd.DataFrame, path: str):
-    if df is None or (hasattr(df, "empty") and df.empty): return
-    df.to_csv(path, index=False, encoding="utf-8-sig")
+def top_authors_from_file(csv_path: str, topn=10):
+    if not csv_path or not os.path.exists(csv_path): return None
+    counts = {}
+    for chunk in pd.read_csv(csv_path, usecols=["author"], chunksize=200_000):
+        vc = chunk["author"].astype(str).value_counts()
+        for k, v in vc.items():
+            counts[k] = counts.get(k, 0) + int(v)
+    if not counts: return None
+    s = pd.Series(counts).sort_values(ascending=False).head(topn)
+    return s.reset_index().rename(columns={"index": "author", 0: "count"}).rename(columns={"count": "count"})
 
+def render_quant_viz_from_paths(comments_csv_path: str, df_stats: pd.DataFrame, scope_label="(KST 기준)", wrap_in_expander: bool = True):
+    if not comments_csv_path or not os.path.exists(comments_csv_path): return
+    wrapper = (st.expander("📊 정량 요약", expanded=True) if wrap_in_expander else st.container(border=True))
+    with wrapper:
+        col1, col2 = st.columns(2)
+        with col1:
+            with st.container(border=True):
+                st.subheader("① 키워드 버블")
+                try:
+                    custom_stopwords = {
+                        "아","휴","아이구","아이쿠","아이고","어","나","우리","저희","따라","의해","을","를",
+                        "에","의","가","으로","로","에게","뿐이다","의거하여","근거하여","입각하여","기준으로",
+                        "그냥","댓글","영상","오늘","이제","뭐","진짜","정말","부분","요즘","제발","완전",
+                        "그게","일단","모든","위해","대한","있지","이유","계속","실제","유튜브","이번","가장","드라마",
+                    }
+                    stopset = set(korean_stopwords); stopset.update(custom_stopwords)
+                    query_kw = (st.session_state.get("s_query") or st.session_state.get("last_keyword") or st.session_state.get("adv_analysis_keyword") or "").strip()
+                    if query_kw:
+                        tokens_q = kiwi.tokenize(query_kw, normalize_coda=True)
+                        query_words = [t.form for t in tokens_q if t.tag in ("NNG","NNP") and len(t.form) > 1]
+                        stopset.update(query_words)
+                    with st.spinner("키워드 계산 중…"):
+                        items = compute_keyword_counter_from_file(comments_csv_path, list(stopset), per_comment_cap=200)
+                    fig = keyword_bubble_figure_from_counter(items)
+                    if fig is None:
+                        st.info("표시할 키워드가 없습니다(불용어 제거 후 남은 단어 없음).")
+                    else:
+                        st.plotly_chart(fig, use_container_width=True)
+                except Exception as e:
+                    st.info(f"키워드 분석 불가: {e}")
+
+        with col2:
+            with st.container(border=True):
+                st.subheader("② 시점별 댓글량 변동 추이")
+                ts, label = timeseries_from_file(comments_csv_path)
+                if ts is not None:
+                    fig_ts = px.line(ts, x="bucket", y="count", markers=True, title=f"{label} 댓글량 추이 {scope_label}")
+                    st.plotly_chart(fig_ts, use_container_width=True)
+                else:
+                    st.info("댓글 타임스탬프가 비어 있습니다.")
+
+        if df_stats is not None and not df_stats.empty:
+            col3, col4 = st.columns(2)
+            with col3:
+                with st.container(border=True):
+                    st.subheader("③ Top10 영상 댓글수")
+                    top_vids = df_stats.sort_values(by="commentCount", ascending=False).head(10).copy()
+                    top_vids["title_short"] = top_vids["title"].apply(lambda t: t[:20] + "…" if isinstance(t, str) and len(t) > 20 else t)
+                    fig_vids = px.bar(top_vids, x="commentCount", y="title_short",
+                                      orientation="h", text="commentCount", title="Top10 영상 댓글수")
+                    st.plotly_chart(fig_vids, use_container_width=True)
+            with col4:
+                with st.container(border=True):
+                    st.subheader("④ 댓글 작성자 활동량 Top10")
+                    ta = top_authors_from_file(comments_csv_path, topn=10)
+                    if ta is not None and not ta.empty:
+                        fig_auth = px.bar(ta, x="count", y="author", orientation="h", text="count", title="Top10 댓글 작성자 활동량")
+                        st.plotly_chart(fig_auth, use_container_width=True)
+                    else:
+                        st.info("작성자 데이터 없음")
+
+        with st.container(border=True):
+            st.subheader("⑤ 댓글 좋아요 Top10")
+            best = []
+            for chunk in pd.read_csv(comments_csv_path, usecols=["video_id","video_title","author","text","likeCount"], chunksize=200_000):
+                chunk["likeCount"] = pd.to_numeric(chunk["likeCount"], errors="coerce").fillna(0).astype(int)
+                best.append(chunk.sort_values("likeCount", ascending=False).head(10))
+            if best:
+                df_top = pd.concat(best).sort_values("likeCount", ascending=False).head(10)
+                for _, row in df_top.iterrows():
+                    url = f"https://www.youtube.com/watch?v={row['video_id']}"
+                    st.markdown(
+                        f"<div style='margin-bottom:15px;'>"
+                        f"<b>{int(row['likeCount'])} 👍</b> — {row.get('author','')}<br>"
+                        f"<span style='font-size:14px;'>▶️ <a href='{url}' target='_blank' style='color:black; text-decoration:none;'>"
+                        f"{str(row.get('video_title','(제목없음)'))[:60]}</a></span><br>"
+                        f"> {str(row.get('text',''))[:150]}{'…' if len(str(row.get('text','')))>150 else ''}"
+                        f"</div>", unsafe_allow_html=True
+                    )
+
+# ===================== 저장/아카이브 =====================
 def _slugify_filename(s: str) -> str:
     s = (s or "").strip()
     s = re.sub(r"\s+", "_", s)
     s = re.sub(r"[^\w\-]+", "", s)
-    if not s:
-        s = "no_kw"
+    if not s: s = "no_kw"
     return s[:60]
 
 def _build_session_name() -> str:
-    # 이름 포맷: 검색어_yyyy-mm-dd-hh:mm_검색기간 (KST)
     kw = (st.session_state.get("s_query") or st.session_state.get("last_keyword") or "").strip() or "no_kw"
     preset = (st.session_state.get("s_preset") or "최근 1년").replace(" ", "")
     now_kst = datetime.now(_kst_tz()).strftime("%Y-%m-%d-%H:%M")
     return f"{_slugify_filename(kw)}_{now_kst}_{preset}"
 
 def save_current_session():
-    # 세션 이름 및 로컬 저장
     sess_name = _build_session_name()
     outdir = os.path.join(SESS_DIR, sess_name)
     os.makedirs(outdir, exist_ok=True)
@@ -701,29 +828,43 @@ def save_current_session():
         "simple_query": st.session_state.get("s_query",""),
         "last_keyword": st.session_state.get("last_keyword",""),
         "preset": st.session_state.get("s_preset",""),
+        "last_tab": st.session_state.get("last_tab","심플"),
         "saved_at_kst": datetime.now(_kst_tz()).strftime("%Y-%m-%d %H:%M:%S")
     }
     with open(os.path.join(outdir, "qa.json"), "w", encoding="utf-8") as f:
         json.dump(qa_data, f, ensure_ascii=False, indent=2)
 
-    # CSV 저장
-    _save_df_csv(st.session_state.get("s_df_comments"), os.path.join(outdir, "simple_comments_full.csv"))
-    _save_df_csv(st.session_state.get("s_df_analysis"), os.path.join(outdir, "simple_comments_sample.csv"))
-    _save_df_csv(st.session_state.get("s_df_stats"), os.path.join(outdir, "simple_videos.csv"))
-    _save_df_csv(st.session_state.get("df_comments"), os.path.join(outdir, "adv_comments_full.csv"))
-    _save_df_csv(st.session_state.get("df_analysis"), os.path.join(outdir, "adv_comments_sample.csv"))
-    _save_df_csv(st.session_state.get("df_stats"), os.path.join(outdir, "adv_videos.csv"))
+    def _copy_if_exists(src_path, dst_name):
+        if src_path and os.path.exists(src_path):
+            dst_path = os.path.join(outdir, dst_name)
+            with open(src_path, "rb") as rf, open(dst_path, "wb") as wf:
+                wf.write(rf.read())
+            return dst_path
+        return None
 
-    # GitHub 업로드
+    # 심플
+    _copy_if_exists(st.session_state.get("s_comments_path",""), "simple_comments_full.csv")
+    s_df_stats = st.session_state.get("s_df_stats")
+    if s_df_stats is not None and not s_df_stats.empty:
+        s_df_stats.to_csv(os.path.join(outdir,"simple_videos.csv"), index=False, encoding="utf-8-sig")
+
+    # 고급
+    _copy_if_exists(st.session_state.get("adv_comments_path",""), "adv_comments_full.csv")
+    df_stats = st.session_state.get("df_stats")
+    if df_stats is not None and not df_stats.empty:
+        df_stats.to_csv(os.path.join(outdir,"adv_videos.csv"), index=False, encoding="utf-8-sig")
+
     uploaded = []
     if GITHUB_TOKEN and GITHUB_REPO:
+        info = github_upload_file(GITHUB_REPO, GITHUB_BRANCH, f"sessions/{sess_name}/qa.json", os.path.join(outdir,"qa.json"), GITHUB_TOKEN)
+        uploaded.append(info)
         for fn in sorted(os.listdir(outdir)):
+            if fn == "qa.json": continue
             p = os.path.join(outdir, fn)
             if os.path.isfile(p):
                 path_in_repo = f"sessions/{sess_name}/{fn}"
                 info = github_upload_file(GITHUB_REPO, GITHUB_BRANCH, path_in_repo, p, GITHUB_TOKEN)
                 uploaded.append(info)
-
     return sess_name, uploaded
 
 def list_sessions_github():
@@ -732,176 +873,27 @@ def list_sessions_github():
     items = github_list_dir(GITHUB_REPO, GITHUB_BRANCH, "sessions", GITHUB_TOKEN)
     return [x["name"] for x in items if isinstance(x, dict) and x.get("type") == "dir"]
 
-# ===================== 시각화/다운로드(화면 렌더) =====================
-def render_keyword_bubble(s_df_comments):
-    st.subheader("① 키워드 버블")
-    try:
-        custom_stopwords = {
-            "아","휴","아이구","아이쿠","아이고","어","나","우리","저희","따라","의해","을","를",
-            "에","의","가","으로","로","에게","뿐이다","의거하여","근거하여","입각하여","기준으로",
-            "그냥","댓글","영상","오늘","이제","뭐","진짜","정말","부분","요즘","제발","완전",
-            "그게","일단","모든","위해","대한","있지","이유","계속","실제","유튜브","이번","가장","드라마",
-        }
-        stopset = set(korean_stopwords); stopset.update(custom_stopwords)
-
-        # 🔑 검색어 불용어 추가
-        query_kw = (st.session_state.get("s_query") 
-                    or st.session_state.get("last_keyword") 
-                    or st.session_state.get("adv_analysis_keyword") 
-                    or "").strip()
-        if query_kw:
-            tokens_q = kiwi.tokenize(query_kw, normalize_coda=True)
-            query_words = [t.form for t in tokens_q if t.tag in ("NNG","NNP") and len(t.form) > 1]
-            stopset.update(query_words)
-
-        texts = " ".join(s_df_comments["text"].astype(str).tolist())
-        tokens = kiwi.tokenize(texts, normalize_coda=True)
-        words = [t.form for t in tokens if t.tag in ("NNG","NNP") and len(t.form) > 1 and t.form not in stopset]
-        counter = Counter(words)
-        if len(counter) == 0:
-            st.info("표시할 키워드가 없습니다(불용어 제거 후 남은 단어 없음).")
-            return
-        df_kw = pd.DataFrame(counter.most_common(30), columns=["word", "count"])
-        df_kw["label"] = df_kw["word"] + "<br>" + df_kw["count"].astype(str)
-        df_kw["scaled"] = np.sqrt(df_kw["count"])
-        data_for_pack = [{"id": w, "datum": s} for w, s in zip(df_kw["word"], df_kw["scaled"])]
-        circles = circlify.circlify(data_for_pack, show_enclosure=False,
-                                    target_enclosure=circlify.Circle(x=0, y=0, r=1))
-        pos = {c.ex["id"]: (c.x, c.y, c.r) for c in circles if "id" in c.ex}
-        df_kw["x"] = df_kw["word"].map(lambda w: pos[w][0])
-        df_kw["y"] = df_kw["word"].map(lambda w: pos[w][1])
-        df_kw["r"] = df_kw["word"].map(lambda w: pos[w][2])
-        min_size, max_size = 10, 22
-        s_min, s_max = df_kw["scaled"].min(), df_kw["scaled"].max()
-        df_kw["font_size"] = df_kw["scaled"].apply(
-            lambda s: int(min_size + (s - s_min) / (s_max - s_min) * (max_size - min_size)) if s_max > s_min else 14
-        )
-        fig_kw = go.Figure()
-        palette = px.colors.sequential.Blues
-        df_kw["color_idx"] = df_kw["scaled"].apply(lambda s: int((s - s_min) / max(s_max - s_min, 1) * (len(palette) - 1)))
-        for _, row in df_kw.iterrows():
-            color = palette[int(row["color_idx"])]
-            fig_kw.add_shape(
-                type="circle", xref="x", yref="y",
-                x0=row["x"] - row["r"], y0=row["y"] - row["r"],
-                x1=row["x"] + row["r"], y1=row["y"] + row["r"],
-                line=dict(width=0), fillcolor=color, opacity=0.88, layer="below"
-            )
-        fig_kw.add_trace(go.Scatter(
-            x=df_kw["x"], y=df_kw["y"], mode="text",
-            text=df_kw["label"], textposition="middle center",
-            textfont=dict(color="white", size=df_kw["font_size"].tolist()),
-            hovertext=df_kw["word"] + " (" + df_kw["count"].astype(str) + ")",
-            hovertemplate="%{hovertext}<extra></extra>",
-        ))
-        fig_kw.update_xaxes(visible=False, range=[-1.05, 1.05])
-        fig_kw.update_yaxes(visible=False, range=[-1.05, 1.05], scaleanchor="x", scaleratio=1)
-        fig_kw.update_layout(title="Top30 키워드 버블", plot_bgcolor="rgba(0,0,0,0)", margin=dict(l=0, r=0, t=40, b=0))
-        st.plotly_chart(fig_kw, use_container_width=True)
-    except Exception as e:
-        st.info(f"키워드 분석 불가: {e}")
-
-def render_quant_viz(df_comments, df_stats, scope_label="(KST 기준)"):
-    if df_comments is not None and not df_comments.empty:
-        with st.expander("📊 정량 요약", expanded=True):
-            col1, col2 = st.columns(2)
-            with col1:
-                with st.container(border=True):
-                    render_keyword_bubble(df_comments)
-            with col2:
-                with st.container(border=True):
-                    st.subheader("② 시점별 댓글량 변동 추이")
-                    df_time = df_comments.copy()
-                    df_time["publishedAt"] = (
-                        pd.to_datetime(df_time["publishedAt"], errors="coerce", utc=True).dt.tz_convert("Asia/Seoul")
-                    )
-                    df_time = df_time.dropna(subset=["publishedAt"])
-                    if not df_time.empty:
-                        span_hours = (df_time["publishedAt"].max() - df_time["publishedAt"].min()).total_seconds()/3600.0
-                        rule = "H" if span_hours <= 48 else "D"
-                        label = "시간별" if rule == "H" else "일자별"
-                        ts = df_time.resample(rule, on="publishedAt").size().reset_index(name="count")
-                        fig_ts = px.line(ts, x="publishedAt", y="count", markers=True,
-                                         title=f"{label} 댓글량 추이 {scope_label}")
-                        st.plotly_chart(fig_ts, use_container_width=True)
-                    else:
-                        st.info("댓글 타임스탬프가 비어 있습니다.")
-            if df_stats is not None and not df_stats.empty:
-                col3, col4 = st.columns(2)
-                with col3:
-                    with st.container(border=True):
-                        st.subheader("③ Top10 영상 댓글수")
-                        top_vids = df_stats.sort_values(by="commentCount", ascending=False).head(10).copy()
-                        top_vids["title_short"] = top_vids.apply(
-                            lambda r: f'<a href="https://www.youtube.com/watch?v={r["video_id"]}" target="_blank" '
-                                      f'style="color:black; text-decoration:none;">'
-                                      f'{r["title"][:20] + "…" if len(r["title"]) > 20 else r["title"]}</a>',
-                            axis=1
-                        )
-                        fig_vids = px.bar(top_vids, x="commentCount", y="title_short",
-                                          orientation="h", text="commentCount",
-                                          hover_data={"title": True, "video_id": False})
-                        st.plotly_chart(fig_vids, use_container_width=True)
-                with col4:
-                    with st.container(border=True):
-                        st.subheader("④ 댓글 작성자 활동량 Top10")
-                        top_authors = (
-                            df_comments.groupby("author").size().reset_index(name="count")
-                            .sort_values(by="count", ascending=False).head(10)
-                        )
-                        fig_auth = px.bar(top_authors, x="count", y="author", orientation="h", text="count",
-                                          title="Top10 댓글 작성자 활동량")
-                        st.plotly_chart(fig_auth, use_container_width=True)
-                        user_counts = df_comments.groupby("author").size()
-                        total_users = len(user_counts)
-                        active_users = user_counts[user_counts >= 3].count()
-                        perc = (active_users / total_users * 100) if total_users > 0 else 0
-                        st.markdown(f"**3회 이상 댓글 작성 유저 비중:** {active_users:,}명 / {total_users:,}명 ({perc:.1f}%)")
-            with st.container(border=True):
-                st.subheader("⑤ 댓글 좋아요 Top10")
-                top_comments = df_comments.sort_values(by="likeCount", ascending=False).head(10)
-                for _, row in top_comments.iterrows():
-                    url = f"https://www.youtube.com/watch?v={row['video_id']}"
-                    st.markdown(
-                        f"<div style='margin-bottom:15px;'>"
-                        f"<b>{row['likeCount']} 👍</b> — {row['author']}<br>"
-                        f"<span style='font-size:14px;'>▶️ <a href='{url}' target='_blank' style='color:black; text-decoration:none;'>"
-                        f"{row.get('video_title','(제목없음)')}</a></span><br>"
-                        f"> {row['text'][:150]}{'…' if len(row['text'])>150 else ''}"
-                        f"</div>",
-                        unsafe_allow_html=True
-                    )
-
-def render_downloads(df_comments, df_analysis, df_stats, prefix="simple"):
-    if df_comments is not None and not df_comments.empty:
+# ===================== 다운로드 UI =====================
+def render_downloads_from_paths(comments_csv_path: str, df_stats: pd.DataFrame, prefix="simple"):
+    if comments_csv_path and os.path.exists(comments_csv_path):
         st.markdown("---")
         st.subheader("⬇️ 결과 다운로드")
-        csv_full = df_comments.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+        with open(comments_csv_path, "rb") as f:
+            st.download_button(
+                "전체 댓글 (CSV)", data=f.read(),
+                file_name=f"{prefix}_full_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv", key=f"{prefix}_dl_full_csv"
+            )
+    if df_stats is not None and not df_stats.empty:
+        df_videos = df_stats.copy()
+        if "viewCount" in df_videos.columns:
+            df_videos = df_videos.sort_values(by="viewCount", ascending=False).reset_index(drop=True)
+        csv_videos = df_videos.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
         st.download_button(
-            "전체 댓글 (CSV)", data=csv_full,
-            file_name=f"{prefix}_full_{len(df_comments)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv", key=f"{prefix}_dl_full_csv"
+            "전체 영상 (CSV)", data=csv_videos,
+            file_name=f"{prefix}_videolist_{len(df_videos)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv", key=f"{prefix}_dl_videos_csv"
         )
-        if df_analysis is not None and not df_analysis.empty:
-            csv_sample = df_analysis.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-            st.download_button(
-                "분석용 샘플 (CSV)", data=csv_sample,
-                file_name=f"{prefix}_sample_{len(df_analysis)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv", key=f"{prefix}_dl_sample_csv"
-            )
-        if df_stats is not None and not df_stats.empty:
-            df_videos = df_stats.copy()
-            if "viewCount" in df_videos.columns:
-                df_videos = df_videos.sort_values(by="viewCount", ascending=False).reset_index(drop=True)
-            csv_videos = df_videos.applymap(clean_illegal).to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-            st.download_button(
-                "영상목록 (CSV)", data=csv_videos,
-                file_name=f"{prefix}_videolist_{len(df_videos)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv", key=f"{prefix}_dl_videos_csv"
-            )
-
-# ===================== 탭 =====================
-tab_simple, tab_advanced, tab_sessions = st.tabs(["🟢 심플 모드", "⚙️ 고급 모드", "📂 세션 아카이브"])
 
 # ===================== 추가질문 핸들러 =====================
 def handle_followup_simple():
@@ -909,11 +901,9 @@ def handle_followup_simple():
     if not follow_q: return
     if not GEMINI_API_KEYS:
         st.error("Gemini API Key가 없습니다."); return
-    if not st.session_state.get("s_serialized_sample") and (st.session_state.get("s_df_analysis") is not None):
-        st.session_state["s_serialized_sample"] = serialize_comments_for_llm(st.session_state["s_df_analysis"])[0]
-    if not st.session_state.get("s_serialized_sample"):
-        st.error("분석 샘플이 없습니다. 먼저 수집/분석 실행."); return
-    append_log("심플-추가", st.session_state.get("s_query",""), follow_q)  # no-op
+    if not st.session_state.get("s_comments_path"):
+        st.error("댓글 파일이 없습니다. 먼저 수집/분석 실행."); return
+    append_log("심플-추가", st.session_state.get("s_query",""), follow_q)
     context_str = build_history_context(st.session_state.get("s_history", []))
     system_instruction = (
         "너는 유튜브 댓글을 분석하는 어시스턴트다. "
@@ -921,10 +911,11 @@ def handle_followup_simple():
         "이전 맥락을 모두 고려하여 한국어로 간결하고 구조화된 답을 하라. "
         "반드시 모든 댓글을 읽고 답변하라."
     )
+    s_text, _, _ = serialize_comments_for_llm_from_file(st.session_state["s_comments_path"])
     payload = ((context_str + "\n\n") if context_str else "") + (
         f"[현재 질문]: {follow_q}\n"
         f"[기간]: {st.session_state.get('s_preset','최근 1년')}\n\n"
-        f"[댓글 샘플]:\n{st.session_state['s_serialized_sample']}\n"
+        f"[댓글 샘플]:\n{s_text}\n"
     )
     out = call_gemini_rotating(GEMINI_MODEL, GEMINI_API_KEYS, system_instruction, payload)
     st.session_state["s_history"].append((follow_q, out))
@@ -937,11 +928,10 @@ def handle_followup_advanced():
     if not adv_follow_q: return
     if not GEMINI_API_KEYS:
         st.error("Gemini API Key가 없습니다."); return
-    df_analysis = st.session_state.get("df_analysis")
-    if df_analysis is None or df_analysis.empty:
-        st.error("분석 샘플이 없습니다. 먼저 수집/분석 실행."); return
-    append_log("고급-추가", st.session_state.get("last_keyword",""), adv_follow_q)  # no-op
-    a_text = st.session_state.get("adv_serialized_sample", "") or serialize_comments_for_llm(df_analysis)[0]
+    if not st.session_state.get("adv_comments_path"):
+        st.error("댓글 파일이 없습니다. 먼저 수집/분석 실행."); return
+    append_log("고급-추가", st.session_state.get("last_keyword",""), adv_follow_q)
+    a_text, _, _ = serialize_comments_for_llm_from_file(st.session_state["adv_comments_path"])
     context_str = build_history_context(st.session_state.get("adv_history", []))
     system_instruction = (
         "너는 유튜브 댓글을 분석하는 어시스턴트다. "
@@ -960,8 +950,8 @@ def handle_followup_advanced():
     st.session_state["adv_follow_q"] = ""
     st.success("추가 분석 완료(고급)")
 
-# ===================== 1) 심플 모드 =====================
-with tab_simple:
+# ===================== 1) 심플 =====================
+if tab == "심플":
     st.subheader("최근 기간 댓글 반응 — 드라마/배우명으로 바로 분석")
     s_query = st.text_input("드라마 or 배우명", value=st.session_state.get("s_query", ""),
                             placeholder="키워드 입력", key="simple_query")
@@ -1003,14 +993,13 @@ with tab_simple:
         elif not st.session_state["simple_query"].strip():
             st.warning("드라마 or 배우명을 입력하세요.")
         else:
-            # === 동시 실행 락 시도 ===
             if not lock_guard_start_or_warn():
                 st.stop()
             try:
                 st.session_state["s_query"] = st.session_state["simple_query"].strip()
                 st.session_state["s_preset"] = preset_simple
                 st.session_state["s_history"] = []
-                append_log("심플", st.session_state["s_query"], st.session_state.get("simple_question", ""))  # no-op
+                append_log("심플", st.session_state["s_query"], st.session_state.get("simple_question", ""))
 
                 status_ph = st.empty()
                 with status_ph.status("심플 모드 실행 중…", expanded=True) as status:
@@ -1024,12 +1013,11 @@ with tab_simple:
                     df_stats = pd.DataFrame(stats)
                     st.session_state["s_df_stats"] = df_stats
 
-                    # 병렬 댓글 수집 (대댓글 제외)
                     status.write("💬 댓글 수집 중…")
                     video_list = df_stats.to_dict('records')
                     prog = st.progress(0, text="수집 진행 중")
                     log_ph = st.empty()
-                    rows = parallel_collect_comments(
+                    csv_path, total_cnt = parallel_collect_comments_streaming(
                         video_list=video_list,
                         rt_keys=YT_API_KEYS,
                         include_replies=False,
@@ -1038,25 +1026,13 @@ with tab_simple:
                         log_callback=log_ph.write,
                         prog_callback=prog.progress
                     )
+                    st.session_state["s_comments_path"] = csv_path
+                    st.session_state["s_total_count"] = int(total_cnt)
 
-                    if not rows:
+                    if total_cnt == 0:
                         status.update(label="⚠️ 댓글을 수집하지 못했습니다.", state="error")
-                        st.session_state["s_df_comments"] = None
-                        st.session_state["s_df_analysis"] = None
-                        st.session_state["s_serialized_sample"] = ""
                         st.session_state["s_result_text"] = ""
                     else:
-                        df_comments = pd.DataFrame(rows).applymap(clean_illegal)
-                        st.session_state["s_df_comments"] = df_comments
-                        df_analysis = sample_max_5000(df_comments)
-                        st.session_state["s_df_analysis"] = df_analysis
-
-                        s_text, _, _ = serialize_comments_for_llm(
-                            df_analysis, max_rows=1500, max_chars_per_comment=280, max_total_chars=450_000
-                        )
-                        st.session_state["s_serialized_sample"] = s_text
-
-                        # Gemini 분석
                         status.write("🧠 AI 분석 중…")
                         system_instruction = (
                             "너는 유튜브 댓글을 분석하는 어시스턴트다. "
@@ -1067,6 +1043,7 @@ with tab_simple:
                         )
                         default_q = f"{preset_simple} 기준으로 '{st.session_state['s_query']}'에 대한 유튜브 댓글 반응을 요약해줘."
                         prompt_q = (st.session_state.get("simple_question", "").strip() or default_q)
+                        s_text, _, _ = serialize_comments_for_llm_from_file(csv_path)
                         payload = (
                             f"[키워드]: {st.session_state['s_query']}\n"
                             f"[질문]: {prompt_q}\n"
@@ -1082,37 +1059,37 @@ with tab_simple:
                 status_ph.empty()
             finally:
                 release_lock()
+                gc.collect()
 
-    # 결과/추가질문/시각화/다운로드
-    s_df_comments = st.session_state.get("s_df_comments")
-    s_df_analysis = st.session_state.get("s_df_analysis")
+    s_comments_path = st.session_state.get("s_comments_path","")
     s_df_stats = st.session_state.get("s_df_stats")
 
-    if s_df_comments is not None and not s_df_comments.empty:
-        st.success(f"수집 완료 — 전체 {len(s_df_comments):,}개 / 샘플 {len(s_df_analysis):,}개")
+    if s_comments_path and os.path.exists(s_comments_path):
+        st.success(f"수집 완료 — 전체 {st.session_state.get('s_total_count',0):,}개")
 
-    if st.session_state.get("s_result_text"):
-        with st.expander("🧠 AI 분석 결과", expanded=True):
-            st.markdown(st.session_state["s_result_text"])
-        if st.session_state.get("s_history"):
-            st.markdown("### 📝 추가 질문 히스토리")
-            for i, (q, a) in enumerate(st.session_state["s_history"][1:], start=1):
-                with st.expander(f"Q{i}. {q}", expanded=True):
-                    st.markdown(a or "_응답 없음_")
+    if st.session_state.get("s_history"):
+        with st.expander("🧠 AI 분석 결과 (최신)", expanded=True):
+            last_q, last_a = st.session_state["s_history"][-1]
+            st.markdown(f"**Q. {last_q}**")
+            st.markdown(last_a)
+        st.markdown("### 📝 전체 질문 히스토리")
+        for i, (q, a) in enumerate(st.session_state["s_history"], start=1):
+            with st.expander(f"{i}. {q}", expanded=False):
+                st.markdown(a or "_응답 없음_")
         st.markdown("#### ➕ 추가 질문하기")
         st.text_input("추가 질문", placeholder="예: 주연배우들에 대한 반응은 어때?",
                       key="simple_follow_q", on_change=handle_followup_simple)
         st.button("질문 보내기", key="simple_follow_btn", on_click=handle_followup_simple)
 
-    render_quant_viz(s_df_comments, s_df_stats, scope_label="(KST 기준)")
-    render_downloads(s_df_comments, s_df_analysis, s_df_stats, prefix="simple")
+    render_quant_viz_from_paths(s_comments_path, s_df_stats, scope_label="(KST 기준)", wrap_in_expander=True)
+    render_downloads_from_paths(s_comments_path, s_df_stats, prefix="simple")
 
     if st.button("💾 세션 저장하기", key="simple_save_session"):
         name, _ = save_current_session()
         st.success(f"세션 저장 완료: {name}")
 
-# ===================== 2) 고급 모드 =====================
-with tab_advanced:
+# ===================== 2) 고급 =====================
+if tab == "고급":
     st.subheader("고급 모드")
 
     mode = st.radio("모드", ["검색 모드", "URL 직접 입력 모드"],
@@ -1187,8 +1164,6 @@ with tab_advanced:
                 st.session_state["df_stats"] = df
                 st.session_state["selected_ids"] = df["video_id"].tolist() if not df.empty else []
                 st.session_state["focus_step"] = 2
-                st.success(f"목록 준비 완료 — 총 {len(df)}개")
-                st.rerun()
 
     # ② 영상선택 및 URL추가
     expanded2 = (st.session_state["focus_step"] == 2)
@@ -1197,32 +1172,24 @@ with tab_advanced:
         if df_stats is None or df_stats.empty:
             st.info("①에서 먼저 목록을 가져오세요.")
         else:
-            df_show = df_stats.copy()
-            df_show["select"] = df_show["video_id"].apply(lambda v: v in st.session_state["selected_ids"])
-            df_view = df_show[["video_id","select","title","channelTitle","shortType","viewCount","commentCount","publishedAt","video_url"]].set_index("video_id")
-            edited = st.data_editor(
-                df_view,
-                column_config={
-                    "select": st.column_config.CheckboxColumn("선택", default=True),
-                    "title": st.column_config.TextColumn("제목"),
-                    "channelTitle": st.column_config.TextColumn("채널"),
-                    "shortType": st.column_config.TextColumn("타입"),
-                    "viewCount": st.column_config.NumberColumn("조회수", format="%,d"),
-                    "commentCount": st.column_config.NumberColumn("댓글수", format="%,d"),
-                    "publishedAt": st.column_config.TextColumn("업로드(KST)"),
-                    "video_url": st.column_config.LinkColumn("유튜브 링크", display_text="보기"),
-                },
-                use_container_width=True, num_rows="fixed", hide_index=False, key="adv_editor_table",
+            st.dataframe(
+                df_stats[["video_id","title","channelTitle","shortType","viewCount","commentCount","publishedAt"]],
+                use_container_width=True
             )
-            st.session_state["selected_ids"] = [vid for vid, row in edited.iterrows() if bool(row.get("select", False))]
-            st.caption(f"선택된 영상: {len(st.session_state['selected_ids'])} / {len(edited)}")
-            csel1, csel2, _ = st.columns([1,1,6])
-            if csel1.button("전체선택", key="adv_select_all"):
-                st.session_state["selected_ids"] = df_stats["video_id"].tolist(); st.rerun()
-            if csel2.button("전체해제", key="adv_clear_all"):
-                st.session_state["selected_ids"] = []; st.rerun()
-            st.markdown("---")
+            st.caption("선택: video_id 콤마(,)로 입력, 비우면 전체 선택")
+            manual_select = st.text_input("선택 video_id 목록(옵션)", key="adv_manual_select")
+            if st.button("선택 적용", key="adv_apply_select"):
+                if manual_select.strip():
+                    ids = [s.strip() for s in manual_select.split(",") if s.strip()]
+                    valid = [i for i in ids if i in df_stats["video_id"].tolist()]
+                    st.session_state["selected_ids"] = valid
+                    st.success(f"적용됨: {len(valid)}개 선택")
+                else:
+                    st.session_state["selected_ids"] = df_stats["video_id"].tolist()
+                    st.success(f"전체 {len(st.session_state['selected_ids'])}개 선택")
+
             if st.session_state["mode"] == "검색 모드":
+                st.markdown("---")
                 st.subheader("➕ 추가 URL/ID 병합")
                 add_text = st.text_area("추가할 URL/ID (줄바꿈 구분)", height=100,
                                         placeholder="https://youtu.be/XXXXXXXXXXX\nXXXXXXXXXXX\n...", key="adv_add_text")
@@ -1248,7 +1215,7 @@ with tab_advanced:
                             .reset_index(drop=True)
                         )
                         st.session_state["selected_ids"] = list(dict.fromkeys(st.session_state["selected_ids"] + add_ids))
-                        st.success(f"추가 {len(add_ids)}개 병합 완료"); st.rerun()
+                        st.success(f"추가 {len(add_ids)}개 병합 완료")
                     else:
                         st.info("추가할 신규 URL/ID가 없습니다.")
             st.markdown("---")
@@ -1257,7 +1224,6 @@ with tab_advanced:
                     st.warning("선택된 영상이 없습니다.")
                 else:
                     st.session_state["focus_step"] = 3
-                    st.rerun()
 
     # ③ 댓글추출
     expanded3 = (st.session_state["focus_step"] == 3)
@@ -1283,7 +1249,7 @@ with tab_advanced:
                             video_list = [{"video_id": vid, "title": "", "shortType": "Clip"} for vid in target_ids]
                         prog = st.progress(0, text="수집 진행")
                         log_ph = st.empty()
-                        rows = parallel_collect_comments(
+                        csv_path, total_cnt = parallel_collect_comments_streaming(
                             video_list=video_list,
                             rt_keys=YT_API_KEYS,
                             include_replies=st.session_state.get("adv_include_replies_collect", False),
@@ -1292,32 +1258,26 @@ with tab_advanced:
                             log_callback=log_ph.write,
                             prog_callback=prog.progress
                         )
-                        if rows:
-                            df_comments = pd.DataFrame(rows).applymap(clean_illegal)
-                            st.session_state["df_comments"] = df_comments
-                            df_analysis = sample_max_5000(df_comments)
-                            st.session_state["df_analysis"] = df_analysis
-                            a_text, _, _ = serialize_comments_for_llm(
-                                df_analysis, max_rows=1500, max_chars_per_comment=280, max_total_chars=450_000
-                            )
-                            st.session_state["adv_serialized_sample"] = a_text
-                            st.success("댓글 수집 완료! 필요 시 아래에서 파일 다운로드 후 다음 단계로 이동하세요.")
+                        if total_cnt > 0:
+                            st.session_state["adv_comments_path"] = csv_path
+                            st.session_state["adv_total_count"] = int(total_cnt)
+                            st.success(f"댓글 수집 완료! 총 {total_cnt:,}개")
                         else:
                             st.warning("댓글이 수집되지 않았습니다.")
                     finally:
                         release_lock()
-                if st.button("다음: AI분석으로 이동", type="primary", key="adv_go_to_step4"):
-                    st.session_state["focus_step"] = 4
-                    st.rerun()
+                        gc.collect()
+            if st.button("다음: AI분석으로 이동", type="primary", key="adv_go_to_step4"):
+                st.session_state["focus_step"] = 4
 
     # ④ AI분석
     expanded4 = (st.session_state["focus_step"] == 4)
     with st.expander("④ AI분석", expanded=expanded4):
-        df_analysis = st.session_state["df_analysis"]
-        if df_analysis is None or df_analysis.empty:
+        adv_comments_path = st.session_state.get("adv_comments_path","")
+        if not adv_comments_path or not os.path.exists(adv_comments_path):
             st.info("③에서 댓글 수집을 완료하면 여기에 분석 기능이 활성화됩니다.")
         else:
-            st.write(f"분석 대상 샘플 댓글 수: **{len(df_analysis):,}** (최대 5,000개)")
+            st.write(f"분석 대상 전체 댓글 수: **{st.session_state.get('adv_total_count',0):,}**")
             analysis_keyword = st.text_input("관련 키워드(분석 컨텍스트)",
                                              value=st.session_state.get("last_keyword", ""),
                                              placeholder="예: 윤두준", key="adv_analysis_keyword")
@@ -1330,10 +1290,10 @@ with tab_advanced:
                     if not lock_guard_start_or_warn():
                         st.stop()
                     try:
-                        append_log("고급", analysis_keyword, user_question_adv)  # no-op
+                        append_log("고급", analysis_keyword, user_question_adv)
                         st.session_state["adv_history"] = []
                         st.session_state["adv_followups"] = []
-                        a_text = st.session_state.get("adv_serialized_sample", "") or serialize_comments_for_llm(df_analysis)[0]
+                        a_text, _, _ = serialize_comments_for_llm_from_file(adv_comments_path)
                         system_instruction = (
                             "너는 유튜브 댓글을 분석하는 어시스턴트다. "
                             "아래 키워드와 댓글 샘플을 바탕으로 사용자 질문에 답하라. "
@@ -1348,14 +1308,22 @@ with tab_advanced:
                         st.success("AI 분석 완료")
                     finally:
                         release_lock()
+                        gc.collect()
 
             if st.session_state.get("adv_result_text"):
-                st.markdown("#### 📄 분석 결과")
+                st.markdown("#### 📄 분석 결과 (최신)")
+                last_q, last_a = st.session_state["adv_history"][-1]
+                st.markdown(f"**Q. {last_q}**")
                 st.markdown(st.session_state["adv_result_text"])
+
+                # 정량요약: ④ 내부에서만 표시 (expander 중첩 회피)
+                df_stats_cur = st.session_state.get("df_stats")
+                render_quant_viz_from_paths(adv_comments_path, df_stats_cur, scope_label="(KST 기준)", wrap_in_expander=False)
+
                 if st.session_state["adv_followups"]:
                     st.markdown("### 📝 추가 질문 히스토리")
                     for i, (q, a) in enumerate(st.session_state["adv_followups"], start=1):
-                        with st.expander(f"Q{i}. {q}", expanded=True):
+                        with st.expander(f"{i}. {q}", expanded=False):
                             st.markdown(a or "_응답 없음_")
                 st.markdown("#### ➕ 추가 질문하기")
                 st.text_input("추가 질문", placeholder="예: 긍/부정 키워드 Top5는?",
@@ -1366,16 +1334,15 @@ with tab_advanced:
                     name, _ = save_current_session()
                     st.success(f"세션 저장 완료: {name}")
 
-    render_quant_viz(st.session_state.get("df_comments"), st.session_state.get("df_stats"), scope_label="(KST 기준)")
-    render_downloads(st.session_state.get("df_comments"), st.session_state.get("df_analysis"),
-                     st.session_state.get("df_stats"), prefix=f"adv_{len(st.session_state.get('selected_ids', []))}vids")
+    # 하단: 다운로드 (전체댓글/영상)
+    render_downloads_from_paths(st.session_state.get("adv_comments_path",""), st.session_state.get("df_stats"), prefix=f"adv_{len(st.session_state.get('selected_ids', []))}vids")
 
     if st.button("💾 세션 저장하기", key="adv_save_session_comments"):
         name, _ = save_current_session()
         st.success(f"세션 저장 완료: {name}")
 
 # ===================== 3) 세션 아카이브 (GitHub) =====================
-with tab_sessions:
+if tab == "세션":
     st.subheader("저장된 세션 아카이브 ")
 
     if not (GITHUB_TOKEN and GITHUB_REPO):
@@ -1386,40 +1353,64 @@ with tab_sessions:
             st.info("저장된 세션이 없습니다.")
         else:
             selected_name = st.selectbox("세션 선택", session_dirs, key="sess_select_github")
+
+            # 선택 즉시: 두 개 파일만 표시 (전체댓글 / 전체영상)
             if selected_name:
-                c1, c2 = st.columns([1,3])
-                if c1.button("📂 이 세션 불러오기", key="btn_load_session"):
-                    # 위젯 생성 전 세션 주입을 위해 플래그 세팅 후 rerun
+                base_local = os.path.join(SESS_DIR, selected_name)
+                os.makedirs(base_local, exist_ok=True)
+
+                candidates_comments = [
+                    "adv_comments_full.csv.gz", "adv_comments_full.csv",
+                    "simple_comments_full.csv.gz", "simple_comments_full.csv"
+                ]
+                candidates_videos = [
+                    "adv_videos.csv", "simple_videos.csv"
+                ]
+
+                def _ensure_local_and_button(label, filename_key, btn_key):
+                    remote_path = f"sessions/{selected_name}/{filename_key}"
+                    local_path = os.path.join(base_local, filename_key)
+                    ok = github_download_file(GITHUB_REPO, GITHUB_BRANCH, remote_path, GITHUB_TOKEN, local_path)
+                    if ok and os.path.exists(local_path):
+                        with open(local_path, "rb") as f:
+                            st.download_button(f"{label}", data=f.read(), file_name=filename_key, key=btn_key)
+                        return True
+                    return False
+
+                st.markdown("### ⬇️ 빠른 다운로드")
+
+                # 전체댓글
+                got_comments = False
+                for fn in candidates_comments:
+                    if _ensure_local_and_button("전체댓글 CSV", fn, f"dl_{selected_name}_{fn}"):
+                        got_comments = True
+                        break
+                if not got_comments:
+                    st.caption("전체댓글 파일 없음")
+
+                # 전체영상
+                got_videos = False
+                for fn in candidates_videos:
+                    if _ensure_local_and_button("전체 영상 CSV", fn, f"dl_{selected_name}_{fn}"):
+                        got_videos = True
+                        break
+                if not got_videos:
+                    st.caption("전체영상 파일 없음")
+
+                st.markdown("---")
+                if st.button("📂 이 세션 불러오기", key="btn_load_session"):
                     st.session_state["__pending_session_load"] = selected_name
-                    st.rerun()
+                    safe_rerun()
 
-                # CSV 바로 다운로드 링크(원하는 3개 중심, adv는 있으면 노출)
-                st.markdown("### ⬇️ 세션 내 CSV 바로 다운로드")
-                def _csv_dl(fn):
-                    # raw URL
-                    raw_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_BRANCH}/sessions/{selected_name}/{fn}"
-                    local = os.path.join(SESS_DIR, selected_name, fn)
-                    ok = github_download_file(GITHUB_REPO, GITHUB_BRANCH, f"sessions/{selected_name}/{fn}", GITHUB_TOKEN, local)
-                    colL, colR = st.columns([6,1])
-                    with colL:
-                        st.markdown(f"- **{fn}** · [🔗 Raw로 열기]({raw_url})")
-                    with colR:
-                        if ok and os.path.exists(local):
-                            with open(local, "rb") as f:
-                                st.download_button("다운로드", data=f.read(), file_name=fn, key=f"dl_{selected_name}_{fn}")
-                        else:
-                            st.caption("파일 없음")
-
-                _csv_dl("simple_comments_full.csv")
-                _csv_dl("simple_comments_sample.csv")
-                _csv_dl("simple_videos.csv")
-                _csv_dl("adv_comments_full.csv")
-                _csv_dl("adv_comments_sample.csv")
-                _csv_dl("adv_videos.csv")
-
-# ===================== 초기화 버튼 =====================
+# ===================== 초기화 / 캐시 정리 =====================
 st.markdown("---")
-if st.button("🔄 초기화 하기", type="secondary"):
-    st.session_state.clear()
-    st.rerun()
-
+cols = st.columns(2)
+with cols[0]:
+    if st.button("🔄 초기화 하기", type="secondary"):
+        st.session_state.clear()
+        safe_rerun()
+with cols[1]:
+    if st.button("🧹 캐시/메모리 정리"):
+        st.cache_data.clear()
+        gc.collect()
+        st.success("캐시와 메모리 정리 완료")
