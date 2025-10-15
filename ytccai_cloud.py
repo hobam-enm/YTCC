@@ -31,6 +31,39 @@ try:
 except Exception:
     ILLEGAL_CHARACTERS_RE = None
 
+# ===================== 🔒 하드락(접속 전면 차단) =====================
+# 이 블록이 존재하는 한, 누구도 앱 내용을 볼 수 없습니다.
+# 접근을 허용하려면 이 블록 전체를 삭제하거나, UNLOCK 토큰을 맞춰서 들어가세요(선택).
+import streamlit as st
+import os
+
+# 1) 완전 잠금(기본): True면 무조건 차단
+HARD_LOCK = True
+
+# 2) 임시 해제 옵션(선택):
+#   - Secrets에 UNLOCK_TOKEN 을 설정하고,
+#   - URL에 ?unlock=토큰 값을 붙이면 들어올 수 있음.
+#   - 예: https://<your-app-url>/?unlock=letmein
+ALLOW_UNLOCK_WITH_TOKEN = True
+UNLOCK_TOKEN = st.secrets.get("UNLOCK_TOKEN", "")  # 예: st.secrets에 UNLOCK_TOKEN="letmein"
+
+# --------- 동작 ---------
+qparams = st.experimental_get_query_params() if hasattr(st, "experimental_get_query_params") else {}
+unlock_try = (qparams.get("unlock", [""])[0] or os.environ.get("STREAMLIT_UNLOCK", ""))
+
+should_block = HARD_LOCK
+if ALLOW_UNLOCK_WITH_TOKEN and UNLOCK_TOKEN and unlock_try == UNLOCK_TOKEN:
+    should_block = False  # 올바른 토큰이면 임시 해제
+
+if should_block:
+    # set_page_config을 가장 먼저 호출해야 뒤에서 중복 호출 에러가 안 납니다.
+    st.set_page_config(page_title="접속 제한", layout="wide", initial_sidebar_state="collapsed")
+    st.title("🚫 이 앱은 현재 잠겨 있습니다.")
+    st.caption("관리자만 접근 가능합니다. (이 화면이 뜨면 코드 상단의 🔒 하드락 블록을 삭제하거나 UNLOCK 토큰으로 접속하세요.)")
+    st.stop()
+# ===================== 🔒 하드락 끝 =====================
+
+
 # --- Streamlit rerun 호환 래퍼 ---
 def safe_rerun():
     fn = getattr(st, "rerun", None)
@@ -1414,3 +1447,4 @@ with cols[1]:
         st.cache_data.clear()
         gc.collect()
         st.success("캐시와 메모리 정리 완료")
+
