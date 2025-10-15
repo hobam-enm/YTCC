@@ -1,6 +1,7 @@
 import streamlit as st
 st.set_page_config(page_title="🚫 잠금", layout="wide", initial_sidebar_state="collapsed")
 st.title("🚫 이 앱은 현재 잠겨 있습니다.")
+st.caption("문의: 미디어)디지털마케팅팀 데이터파트 김호범")
 st.stop()
 
 
@@ -1420,5 +1421,6 @@ with cols[1]:
         st.cache_data.clear()
         gc.collect()
         st.success("캐시와 메모리 정리 완료")
+
 
 
