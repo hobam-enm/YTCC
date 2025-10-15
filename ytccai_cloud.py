@@ -1,8 +1,34 @@
+# ===================== 🔐 최상단 비밀번호 게이트 =====================
+# 위치: 이 파일 맨 위, `import streamlit as st` 바로 아래에 붙이세요.
 import streamlit as st
-st.set_page_config(page_title="🚫 잠금", layout="wide", initial_sidebar_state="collapsed")
-st.title("🚫 이 앱은 현재 잠겨 있습니다.")
-st.caption("문의: 미디어)디지털마케팅팀 데이터파트 김호범")
-st.stop()
+
+APP_PASSWORD = "ghqja12"          # <- 하드코딩 비밀번호
+_AUTH_KEY = "__auth_ok__"          # 세션 플래그 키
+
+# 이미 인증되어 있으면 통과
+if not st.session_state.get(_AUTH_KEY, False):
+    # 간단한 로그인 폼 (set_page_config는 여기서 호출하지 않음: 아래 본문 코드와 충돌 방지)
+    st.markdown("### 🔒 접근 제한")
+    st.caption("현재 점검중입니다. 문의: 데이터파트 김호범")
+    with st.form(key="__login_form", clear_on_submit=False):
+        pw = st.text_input("비밀번호", type="password")
+        submitted = st.form_submit_button("입장하기")
+    if submitted:
+        if pw == APP_PASSWORD:
+            st.session_state[_AUTH_KEY] = True
+            # 안전한 리런
+            if hasattr(st, "rerun") and callable(st.rerun):
+                st.rerun()
+            elif hasattr(st, "experimental_rerun") and callable(st.experimental_rerun):
+                st.experimental_rerun()
+        else:
+            st.error("비밀번호가 올바르지 않습니다.")
+            st.stop()
+    else:
+        # 아직 제출 전이면 본문 실행 차단
+        st.stop()
+# ===================== 🔐 비밀번호 게이트 끝 =====================
+
 
 
 # -*- coding: utf-8 -*-
@@ -1421,6 +1447,7 @@ with cols[1]:
         st.cache_data.clear()
         gc.collect()
         st.success("캐시와 메모리 정리 완료")
+
 
 
 
